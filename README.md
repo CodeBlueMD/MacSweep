@@ -57,6 +57,10 @@ The self-test and the tour only create and remove their own test files.
 - Risky items are never selected for you: large files, duplicates, apps, archives, device support files, and working launch agents.
 - System files that need admin rights are reported instead of forced.
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Disclaimer
 
 MacSweep is an independent project. It is not affiliated with or endorsed by Apple or any other cleaner vendor.
