@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+MacSweep.app/
+.DS_Store
+# Scan reports list real file paths; never commit them.
+MacSweep Report*.md
+report*.md
+# Internal analysis notes stay local.
+docs/
