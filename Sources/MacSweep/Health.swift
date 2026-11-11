@@ -136,17 +136,15 @@ final class HealthMonitor: ObservableObject {
 
         let freed = max(0, Int64(before.inactive) - Int64(after.inactive))
         purgeSuccess = true
-        if freed > 10_000_000 {
-            purgeStatusMessage = "Freed \(bytes(freed)) RAM!"
-        } else {
-            purgeStatusMessage = "Memory Purged!"
-        }
+        // Report what was measured; when nothing moved, say so rather than claim a purge.
+        purgeStatusMessage = freed > 10_000_000 ? "Freed \(bytes(freed))" : "Already optimized"
         isPurgingMemory = false
 
         Task {
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             if !self.isPurgingMemory {
                 self.purgeStatusMessage = nil
+                self.purgeSuccess = false // otherwise the green outline outlives its message
             }
         }
     }
@@ -296,7 +294,6 @@ struct AnimatedPressureGauge: View {
                         style: StrokeStyle(lineWidth: size * 0.09, lineCap: .round)
                     )
                     .rotationEffect(.degrees(-90))
-                    .animation(.spring(response: 0.5, dampingFraction: 0.75), value: value)
 
                 // Center readout
                 VStack(spacing: 1) {
@@ -308,17 +305,25 @@ struct AnimatedPressureGauge: View {
                     Text("\(displayPercent)%")
                         .font(.system(size: size * 0.22, weight: .bold, design: .rounded).monospacedDigit())
                         .foregroundStyle(.white)
+                        .contentTransition(.numericText(value: Double(displayPercent)))
                     Text(title)
-                        .font(.system(size: size * 0.13, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.75))
+                        .font(.system(size: max(8, size * 0.13), weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.8))
                 }
             }
             .frame(width: size, height: size)
+            // One spring for the glow, the arc, its colour and the digits, so they move as a unit
+            // (previously only the arc animated and the glow snapped ahead of it).
+            .animation(.spring(response: 0.6, dampingFraction: 0.82), value: value)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(title)
+            .accessibilityValue("\(displayPercent) percent")
 
             if showDetail {
+                // White, not the gauge colour: cyan and yellow captions washed out on the orange and teal pages.
                 Text(subtitle)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(gaugeColor)
+                    .foregroundStyle(.white.opacity(0.85))
                     .lineLimit(1)
             }
         }
@@ -327,37 +332,48 @@ struct AnimatedPressureGauge: View {
 
 struct PurgeMemoryButton: View {
     @ObservedObject var health: HealthMonitor
+    @State private var hovering = false
+    /// Mint reads clearly on every page gradient; system green sank into the teal and green pages.
+    private static let success = Color(red: 0.55, green: 1.0, blue: 0.72)
 
     var body: some View {
         Button {
             Task { await health.purgeInactiveMemory() }
         } label: {
             HStack(spacing: 6) {
-                if health.isPurgingMemory {
-                    ProgressView().controlSize(.mini)
-                    Text("Purging RAM…")
-                        .font(.system(size: 11, weight: .bold))
-                } else if let msg = health.purgeStatusMessage {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                    Text(msg)
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.green)
-                } else {
-                    Image(systemName: "bolt.fill")
-                        .foregroundStyle(.yellow)
-                    Text("Purge Inactive RAM")
-                        .font(.system(size: 11, weight: .bold))
+                Group {
+                    if health.isPurgingMemory {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text("Purging RAM…")
+                        }
+                    } else if let msg = health.purgeStatusMessage {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                            Text(msg)
+                        }
+                        .foregroundStyle(Self.success)
+                    } else {
+                        HStack(spacing: 6) {
+                            Image(systemName: "bolt.fill").foregroundStyle(.yellow)
+                            Text("Purge Inactive RAM")
+                        }
+                    }
                 }
+                .font(.system(size: 11, weight: .bold))
+                .transition(.opacity.combined(with: .scale(scale: 0.92)))
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(Capsule().fill(.white.opacity(0.16)))
-            .overlay(Capsule().strokeBorder(health.purgeSuccess ? Color.green.opacity(0.5) : Color.white.opacity(0.22), lineWidth: 0.8))
+            .background(Capsule().fill(.white.opacity(hovering ? 0.24 : 0.16)))
+            .overlay(Capsule().strokeBorder(health.purgeSuccess ? Self.success.opacity(0.7) : Color.white.opacity(0.22), lineWidth: 0.8))
+            .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressScaleStyle(scale: 0.95))
         .disabled(health.isPurgingMemory)
-        .animation(.easeInOut(duration: 0.25), value: health.isPurgingMemory)
-        .animation(.easeInOut(duration: 0.25), value: health.purgeStatusMessage)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.15), value: hovering)
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: health.isPurgingMemory)
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: health.purgeStatusMessage)
     }
 }
 

@@ -92,25 +92,30 @@ struct ContentView: View {
 /// Icon-only navigation rail; titles appear in a hover label.
 struct Rail: View {
     @ObservedObject var store: Store
+    @Namespace private var selection
 
     var body: some View {
-        VStack(spacing: 6) {
+        // Sized so all eight pages and the three gauges fit the minimum window height; at 52 pt buttons
+        // the CPU gauge was clipped off the bottom of the rail.
+        VStack(spacing: 4) {
             ForEach(Array(Page.rail.enumerated()), id: \.offset) { _, page in
                 if let page {
                     if case .area(let s) = page {
                         RailAreaButton(page: page, model: store.model(s), selected: $store.page,
-                                       forceLabel: store.tourLabel == page)
+                                       forceLabel: store.tourLabel == page, selection: selection)
                     } else {
-                        RailButton(page: page, selected: $store.page, forceLabel: store.tourLabel == page)
+                        RailButton(page: page, selected: $store.page, forceLabel: store.tourLabel == page, selection: selection)
                     }
                 } else {
-                    Capsule().fill(.white.opacity(0.15)).frame(width: 28, height: 1).padding(.vertical, 6)
+                    Capsule().fill(.white.opacity(0.15)).frame(width: 28, height: 1).padding(.vertical, 5)
                 }
             }
             Spacer()
-            RailSystemGauges(store: store).padding(.bottom, 18)
+            RailSystemGauges(health: store.health) { store.page = .maintenance }.padding(.bottom, 18)
         }
         .padding(.top, 52) // room for the window's traffic lights
+        // Scoped to the rail, so the selection pill glides without animating the page behind it.
+        .animation(.spring(response: 0.34, dampingFraction: 0.8), value: store.page)
     }
 }
 
@@ -119,10 +124,11 @@ struct RailAreaButton: View {
     @ObservedObject var model: SectionModel
     @Binding var selected: Page
     var forceLabel = false
+    let selection: Namespace.ID
 
     var body: some View {
         RailButton(page: page, selected: $selected, busy: model.scanning,
-                   badge: model.scanned && model.selectedSize > 0, forceLabel: forceLabel)
+                   badge: model.scanned && model.selectedSize > 0, forceLabel: forceLabel, selection: selection)
     }
 }
 
@@ -133,6 +139,7 @@ struct RailButton: View {
     var badge = false
     /// Shows the hover label without a pointer; used by the UI tour.
     var forceLabel = false
+    let selection: Namespace.ID
     @State private var hovering = false
 
     var body: some View {
@@ -140,8 +147,18 @@ struct RailButton: View {
         Button { selected = page } label: {
             ZStack(alignment: .topTrailing) {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(isSelected ? AnyShapeStyle(.white.opacity(0.22)) : AnyShapeStyle(.white.opacity(hovering ? 0.1 : 0)))
-                    .frame(width: 52, height: 52)
+                    .fill(.white.opacity(hovering && !isSelected ? 0.1 : 0))
+                    .frame(width: 50, height: 48)
+                    .background {
+                        // One pill shared by every button: it slides to the selected page.
+                        if isSelected {
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(.white.opacity(0.22))
+                                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .strokeBorder(.white.opacity(0.28), lineWidth: 0.5))
+                                .matchedGeometryEffect(id: "pill", in: selection)
+                        }
+                    }
                     .overlay(
                         Image(systemName: page.icon)
                             .font(.system(size: 21, weight: .semibold))
@@ -159,20 +176,24 @@ struct RailButton: View {
             }
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressScaleStyle())
         .onHover { hovering = $0 }
         .overlay(alignment: .leading) {
             if hovering || forceLabel {
                 Text(page.title)
                     .font(.system(size: 12, weight: .semibold))
                     .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(Capsule().fill(.black.opacity(0.75)))
+                    .background(Capsule().fill(.black.opacity(0.78)))
+                    .overlay(Capsule().strokeBorder(.white.opacity(0.14), lineWidth: 0.5))
                     .fixedSize()
                     .offset(x: 62)
                     .allowsHitTesting(false)
+                    .transition(.opacity.combined(with: .offset(x: -6)))
             }
         }
+        .animation(.easeOut(duration: 0.14), value: hovering)
         .zIndex(hovering || forceLabel ? 1 : 0)
+        .accessibilityLabel(page.title)
     }
 }
 
@@ -191,8 +212,8 @@ struct DiskGauge: View {
                 Image(systemName: "internaldrive").font(.system(size: 11))
             }
             .frame(width: 34, height: 34)
-            Text(bytes(free)).font(.system(size: 8, weight: .semibold).monospacedDigit()).opacity(0.75)
-            Text("free").font(.system(size: 8)).opacity(0.55)
+            Text(bytes(free)).font(.system(size: 9, weight: .semibold).monospacedDigit()).opacity(0.92)
+            Text("free").font(.system(size: 9, weight: .medium)).opacity(0.7)
         }
         .help("\(bytes(free)) available of \(bytes(total))")
     }
@@ -200,45 +221,81 @@ struct DiskGauge: View {
 
 /// Rail status gauges displaying real-time Disk, RAM pressure, and CPU load.
 struct RailSystemGauges: View {
-    @ObservedObject var store: Store
+    /// Observed directly: `Store` does not republish the monitor's readings, so observing the store
+    /// alone left these gauges frozen until the page changed.
+    @ObservedObject var health: HealthMonitor
+    let open: () -> Void
 
     var body: some View {
-        Button {
-            store.page = .maintenance
-        } label: {
-            VStack(spacing: 10) {
+        Button(action: open) {
+            VStack(spacing: 8) {
                 DiskGauge()
 
                 // Real-time animated RAM mini gauge
                 AnimatedPressureGauge(
                     title: "RAM",
                     subtitle: "",
-                    value: Double(store.health.memoryPressure) / 100.0,
-                    displayPercent: store.health.memoryPressure,
+                    value: Double(health.memoryPressure) / 100.0,
+                    displayPercent: health.memoryPressure,
                     size: 34,
                     showDetail: false
                 )
-                .help("RAM Memory Pressure: \(store.health.memoryPressure)%. Click to open Maintenance.")
+                .help("Memory pressure: \(health.memoryPressure)%. Click to open Maintenance.")
 
                 // Real-time animated CPU mini gauge
                 AnimatedPressureGauge(
                     title: "CPU",
                     subtitle: "",
-                    value: store.health.cpuLoad,
-                    displayPercent: Int(store.health.cpuLoad * 100),
+                    value: health.cpuLoad,
+                    displayPercent: Int(health.cpuLoad * 100),
                     size: 34,
                     showDetail: false
                 )
-                .help("CPU Load: \(Int(store.health.cpuLoad * 100))%. Click to open Maintenance.")
+                .help("CPU load: \(Int(health.cpuLoad * 100))%. Click to open Maintenance.")
             }
             .padding(.vertical, 4)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressScaleStyle())
     }
 }
 
 // MARK: - Building blocks
+
+/// Plain button that dips slightly while pressed, with a quick spring back.
+struct PressScaleStyle: ButtonStyle {
+    var scale: CGFloat = 0.94
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? scale : 1)
+            .animation(.spring(response: 0.22, dampingFraction: 0.7), value: configuration.isPressed)
+    }
+}
+
+/// Small capsule label for an item's safety tier. Light tinted text on a dark capsule stays readable
+/// on every page gradient (purple-on-purple and orange-on-orange did not).
+struct TierTag: View {
+    let text: String
+    let tint: Color
+    var size: CGFloat = 9
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: size, weight: .bold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(.black.opacity(0.28)))
+            .background(Capsule().fill(tint.opacity(0.55)))
+            .overlay(Capsule().strokeBorder(tint.opacity(0.9), lineWidth: 0.75))
+            .fixedSize()
+    }
+}
+
+extension SafetyTier {
+    static let protectedTint = Color(red: 1.0, green: 0.72, blue: 0.30)
+    static let costlyTint = Color(red: 0.80, green: 0.68, blue: 1.0)
+}
 
 struct IconTile: View {
     let symbol: String
@@ -318,7 +375,11 @@ struct BigButton: View {
                                       lineWidth: 2.5)
                 VStack(spacing: 2) {
                     Text(title).font(.system(size: 20, weight: .bold, design: .rounded))
-                    if let subtitle { Text(subtitle).font(.caption.monospacedDigit()).opacity(0.8) }
+                    if let subtitle {
+                        Text(subtitle).font(.caption.monospacedDigit()).opacity(0.85)
+                            .contentTransition(.numericText())
+                            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: subtitle)
+                    }
                 }
             }
             .frame(width: 108, height: 108)
@@ -326,9 +387,10 @@ struct BigButton: View {
             .scaleEffect(hovering && enabled ? 1.05 : 1)
             .contentShape(Circle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressScaleStyle(scale: 0.95))
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.45)
+        .animation(.easeInOut(duration: 0.2), value: enabled)
         .onHover { h in withAnimation(.spring(duration: 0.25)) { hovering = h } }
         .onAppear { pulse = true }
     }
@@ -338,16 +400,22 @@ struct PillButton: View {
     let title: String
     var icon: String? = nil
     let action: () -> Void
+    @State private var hovering = false
+    @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
         Button(action: action) {
             Label { Text(title) } icon: { if let icon { Image(systemName: icon) } }
                 .font(.system(size: 12, weight: .semibold))
                 .padding(.horizontal, 14).padding(.vertical, 7)
-                .background(Capsule().fill(.white.opacity(0.16)))
-                .overlay(Capsule().strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
+                .background(Capsule().fill(.white.opacity(hovering && isEnabled ? 0.26 : 0.16)))
+                .overlay(Capsule().strokeBorder(.white.opacity(hovering && isEnabled ? 0.4 : 0.25), lineWidth: 0.5))
+                .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressScaleStyle(scale: 0.96))
+        .opacity(isEnabled ? 1 : 0.5)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.15), value: hovering)
     }
 }
 
@@ -361,14 +429,16 @@ struct CheckCircle: View {
         ZStack {
             Circle().strokeBorder(.white.opacity(0.7), lineWidth: 1.5)
             if state != .off {
-                Circle().fill(.white)
+                Circle().fill(.white).transition(.scale(scale: 0.4).combined(with: .opacity))
                 Image(systemName: state == .on ? "checkmark" : "minus")
                     .font(.system(size: size * 0.5, weight: .heavy))
                     .foregroundStyle(.black.opacity(0.75))
+                    .transition(.scale(scale: 0.4).combined(with: .opacity))
             }
         }
         .frame(width: size, height: size)
         .contentShape(Circle())
+        .animation(.spring(response: 0.24, dampingFraction: 0.62), value: state)
     }
 }
 
@@ -542,37 +612,32 @@ struct GroupCard: View {
                         HStack(spacing: 6) {
                             Text(group.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
                             if group.tier == .protected {
-                                Text("Protected")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .padding(.horizontal, 5).padding(.vertical, 1.5)
-                                    .background(Capsule().fill(.orange.opacity(0.2)))
-                                    .foregroundStyle(.orange)
+                                TierTag(text: "Protected", tint: SafetyTier.protectedTint)
                             } else if group.tier == .costlyToRebuild {
-                                Text("Costly to Rebuild")
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .padding(.horizontal, 5).padding(.vertical, 1.5)
-                                    .background(Capsule().fill(.purple.opacity(0.25)))
-                                    .foregroundStyle(.purple.opacity(0.95))
+                                TierTag(text: "Costly to Rebuild", tint: SafetyTier.costlyTint)
                             }
                         }
                         Text("\(group.items.count) item\(group.items.count == 1 ? "" : "s")").font(.caption).opacity(0.65)
                     }
                     Spacer()
-                    Text(bytes(group.size)).font(.system(size: 14, weight: .semibold).monospacedDigit())
+                    Text(bytes(group.size)).font(.system(size: 14, weight: .semibold, design: .rounded).monospacedDigit())
                     Image(systemName: "chevron.right")
                         .font(.system(size: 12, weight: .bold)).opacity(0.6)
                         .rotationEffect(.degrees(expanded ? 90 : 0))
                 }
                 .padding(.horizontal, 16).padding(.vertical, 12)
                 .contentShape(Rectangle())
-                .onTapGesture { withAnimation(.spring(duration: 0.3)) { expanded.toggle() } }
+                .onTapGesture { withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { expanded.toggle() } }
 
                 if expanded {
-                    Divider().overlay(.white.opacity(0.15))
                     VStack(spacing: 0) {
-                        ForEach(group.items) { ItemRow(item: $0, model: model) }
+                        Divider().overlay(.white.opacity(0.15))
+                        VStack(spacing: 0) {
+                            ForEach(group.items) { ItemRow(item: $0, model: model) }
+                        }
+                        .padding(.vertical, 4)
                     }
-                    .padding(.vertical, 4)
+                    .transition(.opacity)
                 }
             }
         }
@@ -597,19 +662,9 @@ struct ItemRow: View {
                 HStack(spacing: 6) {
                     Text(item.title).font(.system(size: 13)).lineLimit(1)
                     if let app = item.inUseBy {
-                        Text("In Use by \(app)")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.orange)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1.5)
-                            .background(Capsule().fill(.orange.opacity(0.2)))
+                        TierTag(text: "In Use by \(app)", tint: SafetyTier.protectedTint)
                     } else if item.tier == .costlyToRebuild {
-                        Text("Costly to Rebuild")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.purple.opacity(0.95))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1.5)
-                            .background(Capsule().fill(.purple.opacity(0.22)))
+                        TierTag(text: "Costly to Rebuild", tint: SafetyTier.costlyTint)
                     }
                 }
                 Text(item.detail).font(.caption).opacity(0.6).lineLimit(1).truncationMode(.middle)
@@ -626,6 +681,7 @@ struct ItemRow: View {
         }
         .padding(.horizontal, 16).padding(.leading, 30).padding(.vertical, 6)
         .background(hovering ? Color.white.opacity(0.06) : .clear)
+        .animation(.easeOut(duration: 0.12), value: hovering)
         .contentShape(Rectangle())
         .onTapGesture {
             if on { model.selected.remove(item.id) } else if item.tier != .protected { model.selected.insert(item.id) }

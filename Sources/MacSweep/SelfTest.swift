@@ -15,7 +15,9 @@ enum SelfTest {
         func trash(_ items: [CleanItem]) -> Bool { Scanner.moveToTrash(items).failures.isEmpty }
 
         // 1. A cache folder is found in App Caches, selected, and cleaned (Tier 1: Junk).
-        let cache = Scanner.lib("Caches/app.macsweep.selftest")
+        // Named so it cannot match a running app's bundle ID: an open MacSweep.app (`app.macsweep`) would
+        // otherwise claim `app.macsweep.*` and the in-use rule would correctly hold the folder back.
+        let cache = Scanner.lib("Caches/com.macsweepselftest.cache")
         try? fm.createDirectory(at: cache, withIntermediateDirectories: true)
         try? blob(3_000_000).write(to: cache.appendingPathComponent("blob.bin"))
         let junk = Scanner.scanJunk()

@@ -47,7 +47,7 @@ struct MacSweepApp: App {
 
     var body: some Scene {
         Window("MacSweep", id: "main") {
-            ContentView(store: store).frame(minWidth: 1000, minHeight: 660)
+            ContentView(store: store).frame(minWidth: 1000, minHeight: 700)
         }
         .windowStyle(.hiddenTitleBar)
 

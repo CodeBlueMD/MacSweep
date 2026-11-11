@@ -56,7 +56,9 @@ enum Tour {
 
         // Clean flow: plant a cache, rescan, select only it, press Clean (same call as the button), verify.
         store.tourLabel = nil
-        let planted = Scanner.lib("Caches/app.macsweep.tour")
+        // Not `app.macsweep.*`: the tour runs inside MacSweep itself, whose bundle ID would mark that folder
+        // as in use by an open app and (correctly) hold it back from cleaning.
+        let planted = Scanner.lib("Caches/com.macsweeptour.cache")
         try? FileManager.default.createDirectory(at: planted, withIntermediateDirectories: true)
         try? Data(count: 2_000_000).write(to: planted.appendingPathComponent("blob.bin"))
         let junk = store.model(.junk)

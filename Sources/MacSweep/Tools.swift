@@ -225,55 +225,7 @@ struct MaintenanceView: View {
 
             ScrollView {
                 VStack(spacing: 16) {
-                    // Live Real-Time RAM & CPU Pressure Gauges & 1-Click Purge Card
-                    Card {
-                        HStack(alignment: .center, spacing: 24) {
-                            AnimatedPressureGauge(
-                                title: "RAM",
-                                subtitle: "\(health.memoryPressure)% pressure",
-                                value: Double(health.memoryPressure) / 100.0,
-                                displayPercent: health.memoryPressure,
-                                icon: "memorychip",
-                                size: 90
-                            )
-
-                            AnimatedPressureGauge(
-                                title: "CPU",
-                                subtitle: "\(Int(health.cpuLoad * 100))% load",
-                                value: health.cpuLoad,
-                                displayPercent: Int(health.cpuLoad * 100),
-                                icon: "cpu",
-                                size: 90
-                            )
-
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("Real-Time Memory Pressure")
-                                    .font(.system(size: 15, weight: .bold, design: .rounded))
-                                Text("Total Physical RAM: \(bytes(Int64(health.totalMemory)))")
-                                    .font(.caption.weight(.semibold)).opacity(0.85)
-
-                                HStack(spacing: 16) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("Active: \(bytes(Int64(health.activeMemory)))")
-                                            .font(.caption2).opacity(0.75)
-                                        Text("Inactive: \(bytes(Int64(health.inactiveMemory)))")
-                                            .font(.caption2.weight(.bold)).foregroundStyle(.yellow)
-                                    }
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("Wired: \(bytes(Int64(health.detailedMemory.wired)))")
-                                            .font(.caption2).opacity(0.75)
-                                        Text("Compressed: \(bytes(Int64(health.detailedMemory.compressed)))")
-                                            .font(.caption2).opacity(0.75)
-                                    }
-                                }
-
-                                PurgeMemoryButton(health: health)
-                                    .padding(.top, 4)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .padding(16)
-                    }
+                    LiveHealthCard(health: health)
 
                     LazyVStack(spacing: 10) {
                         ForEach(Maintenance.tasks) { task in
@@ -324,6 +276,63 @@ struct MaintenanceView: View {
         DispatchQueue.main.async {
             results[task.id] = Maintenance.run(task)
             running = nil
+        }
+    }
+}
+
+/// Live RAM and CPU gauges with the 1-click purge. Observes the monitor directly: `Store` does not
+/// republish its readings, so inside `MaintenanceView` this card only refreshed when the page changed.
+struct LiveHealthCard: View {
+    @ObservedObject var health: HealthMonitor
+
+    var body: some View {
+        Card {
+            HStack(alignment: .center, spacing: 24) {
+                AnimatedPressureGauge(
+                    title: "RAM",
+                    subtitle: "\(health.memoryPressure)% pressure",
+                    value: Double(health.memoryPressure) / 100.0,
+                    displayPercent: health.memoryPressure,
+                    icon: "memorychip",
+                    size: 90
+                )
+
+                AnimatedPressureGauge(
+                    title: "CPU",
+                    subtitle: "\(Int(health.cpuLoad * 100))% load",
+                    value: health.cpuLoad,
+                    displayPercent: Int(health.cpuLoad * 100),
+                    icon: "cpu",
+                    size: 90
+                )
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Real-Time Memory Pressure")
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                    Text("Total Physical RAM: \(bytes(Int64(health.totalMemory)))")
+                        .font(.caption.weight(.semibold)).opacity(0.85)
+
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Active: \(bytes(Int64(health.activeMemory)))")
+                                .font(.caption2).opacity(0.75)
+                            Text("Inactive: \(bytes(Int64(health.inactiveMemory)))")
+                                .font(.caption2.weight(.bold)).foregroundStyle(.yellow)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Wired: \(bytes(Int64(health.detailedMemory.wired)))")
+                                .font(.caption2).opacity(0.75)
+                            Text("Compressed: \(bytes(Int64(health.detailedMemory.compressed)))")
+                                .font(.caption2).opacity(0.75)
+                        }
+                    }
+
+                    PurgeMemoryButton(health: health)
+                        .padding(.top, 4)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(16)
         }
     }
 }
