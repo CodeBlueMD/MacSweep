@@ -60,7 +60,7 @@ struct ContentView: View {
                 case .spaceMap:
                     SpaceMapView(model: store.spaceMap)
                 case .maintenance:
-                    MaintenanceView()
+                    MaintenanceView(store: store)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -108,7 +108,7 @@ struct Rail: View {
                 }
             }
             Spacer()
-            DiskGauge().padding(.bottom, 18)
+            RailSystemGauges(store: store).padding(.bottom, 18)
         }
         .padding(.top, 52) // room for the window's traffic lights
     }
@@ -183,18 +183,58 @@ struct DiskGauge: View {
         let total = Int64(v?.volumeTotalCapacity ?? 0)
         let free = v?.volumeAvailableCapacityForImportantUsage ?? 0
         let used = total > 0 ? Double(total - free) / Double(total) : 0
-        VStack(spacing: 4) {
+        VStack(spacing: 3) {
             ZStack {
-                Circle().stroke(.white.opacity(0.15), lineWidth: 4)
-                Circle().trim(from: 0, to: used).stroke(.white.opacity(0.85), style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                Circle().stroke(.white.opacity(0.15), lineWidth: 3.5)
+                Circle().trim(from: 0, to: used).stroke(.white.opacity(0.85), style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
                     .rotationEffect(.degrees(-90))
-                Image(systemName: "internaldrive").font(.system(size: 13))
+                Image(systemName: "internaldrive").font(.system(size: 11))
             }
-            .frame(width: 40, height: 40)
-            Text(bytes(free)).font(.system(size: 9, weight: .semibold).monospacedDigit()).opacity(0.75)
-            Text("free").font(.system(size: 9)).opacity(0.55)
+            .frame(width: 34, height: 34)
+            Text(bytes(free)).font(.system(size: 8, weight: .semibold).monospacedDigit()).opacity(0.75)
+            Text("free").font(.system(size: 8)).opacity(0.55)
         }
         .help("\(bytes(free)) available of \(bytes(total))")
+    }
+}
+
+/// Rail status gauges displaying real-time Disk, RAM pressure, and CPU load.
+struct RailSystemGauges: View {
+    @ObservedObject var store: Store
+
+    var body: some View {
+        Button {
+            store.page = .maintenance
+        } label: {
+            VStack(spacing: 10) {
+                DiskGauge()
+
+                // Real-time animated RAM mini gauge
+                AnimatedPressureGauge(
+                    title: "RAM",
+                    subtitle: "",
+                    value: Double(store.health.memoryPressure) / 100.0,
+                    displayPercent: store.health.memoryPressure,
+                    size: 34,
+                    showDetail: false
+                )
+                .help("RAM Memory Pressure: \(store.health.memoryPressure)%. Click to open Maintenance.")
+
+                // Real-time animated CPU mini gauge
+                AnimatedPressureGauge(
+                    title: "CPU",
+                    subtitle: "",
+                    value: store.health.cpuLoad,
+                    displayPercent: Int(store.health.cpuLoad * 100),
+                    size: 34,
+                    showDetail: false
+                )
+                .help("CPU Load: \(Int(store.health.cpuLoad * 100))%. Click to open Maintenance.")
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -400,7 +440,7 @@ struct SectionView: View {
                 // Selecting every app at once is never what anyone wants from an uninstaller.
                 if model.section != .apps {
                     PillButton(title: "Select All", icon: "checklist") {
-                        model.selected = Set(model.groups.flatMap(\.items).map(\.id))
+                        model.selected = Set(model.groups.flatMap(\.items).filter { $0.tier != .protected }.map(\.id))
                     }
                 }
                 PillButton(title: "Deselect", icon: "circle") { model.selected = [] }
@@ -498,8 +538,23 @@ struct GroupCard: View {
                     } else {
                         IconTile(symbol: group.icon, colors: [.white.opacity(0.35), .white.opacity(0.1)], size: 34)
                     }
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(group.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(group.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                            if group.tier == .protected {
+                                Text("Protected")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .padding(.horizontal, 5).padding(.vertical, 1.5)
+                                    .background(Capsule().fill(.orange.opacity(0.2)))
+                                    .foregroundStyle(.orange)
+                            } else if group.tier == .costlyToRebuild {
+                                Text("Costly to Rebuild")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .padding(.horizontal, 5).padding(.vertical, 1.5)
+                                    .background(Capsule().fill(.purple.opacity(0.25)))
+                                    .foregroundStyle(.purple.opacity(0.95))
+                            }
+                        }
                         Text("\(group.items.count) item\(group.items.count == 1 ? "" : "s")").font(.caption).opacity(0.65)
                     }
                     Spacer()
@@ -524,7 +579,7 @@ struct GroupCard: View {
     }
 
     private func toggleAll() {
-        let ids = group.items.map(\.id)
+        let ids = group.items.filter { $0.tier != .protected }.map(\.id)
         if state == .on { model.selected.subtract(ids) } else { model.selected.formUnion(ids) }
     }
 }
@@ -538,8 +593,25 @@ struct ItemRow: View {
         let on = model.selected.contains(item.id)
         HStack(spacing: 12) {
             CheckCircle(state: on ? .on : .off, size: 16)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(item.title).font(.system(size: 13)).lineLimit(1)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(item.title).font(.system(size: 13)).lineLimit(1)
+                    if let app = item.inUseBy {
+                        Text("In Use by \(app)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(Capsule().fill(.orange.opacity(0.2)))
+                    } else if item.tier == .costlyToRebuild {
+                        Text("Costly to Rebuild")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.purple.opacity(0.95))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(Capsule().fill(.purple.opacity(0.22)))
+                    }
+                }
                 Text(item.detail).font(.caption).opacity(0.6).lineLimit(1).truncationMode(.middle)
             }
             Spacer()
@@ -555,7 +627,9 @@ struct ItemRow: View {
         .padding(.horizontal, 16).padding(.leading, 30).padding(.vertical, 6)
         .background(hovering ? Color.white.opacity(0.06) : .clear)
         .contentShape(Rectangle())
-        .onTapGesture { if on { model.selected.remove(item.id) } else { model.selected.insert(item.id) } }
+        .onTapGesture {
+            if on { model.selected.remove(item.id) } else if item.tier != .protected { model.selected.insert(item.id) }
+        }
         .onHover { hovering = $0 }
     }
 }

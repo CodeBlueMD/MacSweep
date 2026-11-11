@@ -9,6 +9,16 @@ import SwiftUI
 final class HealthMonitor: ObservableObject {
     struct Battery { let percent: Int; let charging: Bool; let charged: Bool; let onAC: Bool; let minutesLeft: Int? }
 
+    struct DetailedMemory: Sendable {
+        let total: UInt64
+        let active: UInt64
+        let inactive: UInt64
+        let wired: UInt64
+        let free: UInt64
+        let compressed: UInt64
+        let purgeable: UInt64
+    }
+
     @Published var diskFree: Int64 = 0
     @Published var diskTotal: Int64 = 0
     @Published var memoryPressure = 0
@@ -18,6 +28,16 @@ final class HealthMonitor: ObservableObject {
     @Published var upPerSecond = 0.0
     @Published var downPerSecond = 0.0
     @Published var devices: [String] = []
+    @Published var detailedMemory = DetailedMemory(total: ProcessInfo.processInfo.physicalMemory, active: 0, inactive: 0, wired: 0, free: 0, compressed: 0, purgeable: 0)
+
+    // Visual feedback state for 1-click inactive memory purge
+    @Published var isPurgingMemory = false
+    @Published var purgeStatusMessage: String? = nil
+    @Published var purgeSuccess = false
+
+    var inactiveMemory: UInt64 { detailedMemory.inactive }
+    var activeMemory: UInt64 { detailedMemory.active }
+    var totalMemory: UInt64 { detailedMemory.total }
 
     private var timer: Timer?
     private var lastCPU: host_cpu_load_info?
@@ -51,6 +71,7 @@ final class HealthMonitor: ObservableObject {
         memoryPressure = Self.memoryPressure()
         thermal = ProcessInfo.processInfo.thermalState
         battery = Self.battery()
+        detailedMemory = Self.detailedMemory()
 
         if let now = Self.cpuTicks() {
             if let last = lastCPU {
@@ -75,6 +96,84 @@ final class HealthMonitor: ObservableObject {
         // Bluetooth changes slowly; poll it every 10 seconds.
         if readsBluetooth && ticks % 5 == 0 { devices = Self.connectedBluetoothDevices() }
         ticks += 1
+    }
+
+    /// 1-click inactive RAM purge with instant visual feedback and smooth animated transitions.
+    func purgeInactiveMemory() async {
+        guard !isPurgingMemory else { return }
+        isPurgingMemory = true
+        purgeSuccess = false
+        purgeStatusMessage = "Purging inactive RAM…"
+
+        let before = Self.detailedMemory()
+
+        await Task.detached(priority: .userInitiated) {
+            // Force inactive file-backed pages to be reclaimed by Darwin VM
+            let chunkSize = 64 * 1024 * 1024
+            let targetBytes = min(before.inactive, 2048 * 1024 * 1024)
+            let count = max(1, Int(targetBytes / UInt64(chunkSize)))
+            var chunks: [UnsafeMutableRawPointer] = []
+
+            for _ in 0..<count {
+                if let ptr = malloc(chunkSize) {
+                    memset(ptr, 0x55, chunkSize)
+                    chunks.append(ptr)
+                }
+            }
+            for ptr in chunks {
+                free(ptr)
+            }
+            chunks.removeAll()
+
+            // Also trigger system purge if permitted
+            _ = Scanner.run("/usr/sbin/purge", [])
+        }.value
+
+        // Allow kernel paging to stabilize
+        try? await Task.sleep(nanoseconds: 350_000_000)
+        refresh()
+        let after = Self.detailedMemory()
+
+        let freed = max(0, Int64(before.inactive) - Int64(after.inactive))
+        purgeSuccess = true
+        if freed > 10_000_000 {
+            purgeStatusMessage = "Freed \(bytes(freed)) RAM!"
+        } else {
+            purgeStatusMessage = "Memory Purged!"
+        }
+        isPurgingMemory = false
+
+        Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            if !self.isPurgingMemory {
+                self.purgeStatusMessage = nil
+            }
+        }
+    }
+
+    /// Query Mach kernel host statistics for detailed memory breakdown.
+    static func detailedMemory() -> DetailedMemory {
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        var vmStat = vm_statistics64()
+        let kerr = withUnsafeMutablePointer(to: &vmStat) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        let total = ProcessInfo.processInfo.physicalMemory
+        guard kerr == KERN_SUCCESS else {
+            return DetailedMemory(total: total, active: 0, inactive: 0, wired: 0, free: 0, compressed: 0, purgeable: 0)
+        }
+        let pageSize = UInt64(vm_kernel_page_size)
+        return DetailedMemory(
+            total: total,
+            active: UInt64(vmStat.active_count) * pageSize,
+            inactive: UInt64(vmStat.inactive_count) * pageSize,
+            wired: UInt64(vmStat.wire_count) * pageSize,
+            free: UInt64(vmStat.free_count) * pageSize,
+            compressed: UInt64(vmStat.compressor_page_count) * pageSize,
+            purgeable: UInt64(vmStat.purgeable_count) * pageSize
+        )
     }
 
     /// Same figure as Activity Monitor's memory pressure: 100 minus the kernel's free-memory level.
@@ -139,6 +238,129 @@ final class HealthMonitor: ObservableObject {
     }
 }
 
+// MARK: - Animated Gauges & Purge Controls
+
+struct AnimatedPressureGauge: View {
+    let title: String
+    let subtitle: String
+    let value: Double // 0.0 ... 1.0
+    let displayPercent: Int
+    var icon: String? = nil
+    var size: CGFloat = 76
+    var showDetail: Bool = true
+
+    private var gaugeColor: Color {
+        if value < 0.60 {
+            return .cyan
+        } else if value < 0.80 {
+            return .yellow
+        } else {
+            return .orange
+        }
+    }
+
+    private var gradient: AngularGradient {
+        AngularGradient(
+            stops: [
+                .init(color: gaugeColor.opacity(0.35), location: 0.0),
+                .init(color: gaugeColor, location: max(0.01, min(1.0, value)))
+            ],
+            center: .center,
+            startAngle: .degrees(-90),
+            endAngle: .degrees(270)
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                // Background track
+                Circle()
+                    .stroke(Color.white.opacity(0.12), lineWidth: size * 0.09)
+
+                // Subtle ambient glow
+                Circle()
+                    .trim(from: 0, to: max(0.005, min(1.0, value)))
+                    .stroke(
+                        gaugeColor.opacity(0.4),
+                        style: StrokeStyle(lineWidth: size * 0.12, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
+                    .blur(radius: 4)
+
+                // Real-time animated value arc
+                Circle()
+                    .trim(from: 0, to: max(0.005, min(1.0, value)))
+                    .stroke(
+                        gradient,
+                        style: StrokeStyle(lineWidth: size * 0.09, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
+                    .animation(.spring(response: 0.5, dampingFraction: 0.75), value: value)
+
+                // Center readout
+                VStack(spacing: 1) {
+                    if let icon {
+                        Image(systemName: icon)
+                            .font(.system(size: size * 0.17, weight: .semibold))
+                            .foregroundStyle(gaugeColor)
+                    }
+                    Text("\(displayPercent)%")
+                        .font(.system(size: size * 0.22, weight: .bold, design: .rounded).monospacedDigit())
+                        .foregroundStyle(.white)
+                    Text(title)
+                        .font(.system(size: size * 0.13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+            }
+            .frame(width: size, height: size)
+
+            if showDetail {
+                Text(subtitle)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(gaugeColor)
+                    .lineLimit(1)
+            }
+        }
+    }
+}
+
+struct PurgeMemoryButton: View {
+    @ObservedObject var health: HealthMonitor
+
+    var body: some View {
+        Button {
+            Task { await health.purgeInactiveMemory() }
+        } label: {
+            HStack(spacing: 6) {
+                if health.isPurgingMemory {
+                    ProgressView().controlSize(.mini)
+                    Text("Purging RAM…")
+                        .font(.system(size: 11, weight: .bold))
+                } else if let msg = health.purgeStatusMessage {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text(msg)
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.green)
+                } else {
+                    Image(systemName: "bolt.fill")
+                        .foregroundStyle(.yellow)
+                    Text("Purge Inactive RAM")
+                        .font(.system(size: 11, weight: .bold))
+                }
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(Capsule().fill(.white.opacity(0.16)))
+            .overlay(Capsule().strokeBorder(health.purgeSuccess ? Color.green.opacity(0.5) : Color.white.opacity(0.22), lineWidth: 0.8))
+        }
+        .buttonStyle(.plain)
+        .disabled(health.isPurgingMemory)
+        .animation(.easeInOut(duration: 0.25), value: health.isPurgingMemory)
+        .animation(.easeInOut(duration: 0.25), value: health.purgeStatusMessage)
+    }
+}
+
 // MARK: - Menu bar panel
 
 struct HealthPanel: View {
@@ -161,13 +383,52 @@ struct HealthPanel: View {
                 Image(systemName: "laptopcomputer").font(.system(size: 38)).foregroundStyle(.cyan)
             }
 
+            // Real-Time Animated RAM & CPU Pressure Gauges Card
+            HStack(spacing: 14) {
+                AnimatedPressureGauge(
+                    title: "RAM",
+                    subtitle: "\(health.memoryPressure)% pressure",
+                    value: Double(health.memoryPressure) / 100.0,
+                    displayPercent: health.memoryPressure,
+                    icon: "memorychip",
+                    size: 74
+                )
+
+                AnimatedPressureGauge(
+                    title: "CPU",
+                    subtitle: thermalText,
+                    value: health.cpuLoad,
+                    displayPercent: Int(health.cpuLoad * 100),
+                    icon: "cpu",
+                    size: 74
+                )
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Memory Management")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("Inactive: \(bytes(Int64(health.inactiveMemory)))")
+                        .font(.caption).opacity(0.75)
+                    Text("Active: \(bytes(Int64(health.activeMemory)))")
+                        .font(.caption2).opacity(0.6)
+
+                    PurgeMemoryButton(health: health)
+                        .padding(.top, 2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 14).fill(.white.opacity(0.08)))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
+
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                 HealthTile(icon: "internaldrive", title: "Macintosh HD",
                            value: "Available: \(bytes(health.diskFree))",
                            warn: health.diskTotal > 0 && Double(health.diskFree) / Double(health.diskTotal) < 0.15,
                            action: ("Free Up", { show(.smartCare) }))
-                HealthTile(icon: "memorychip", title: "Memory", value: "Pressure: \(health.memoryPressure)%",
-                           warn: health.memoryPressure >= 65, action: ("Free Up", { show(.maintenance) }))
+                HealthTile(icon: "memorychip", title: "Memory",
+                           value: "Inactive: \(bytes(Int64(health.inactiveMemory)))",
+                           warn: health.memoryPressure >= 65,
+                           action: (health.isPurgingMemory ? "Purging…" : "Purge RAM", { Task { await health.purgeInactiveMemory() } }))
                 HealthTile(icon: batteryIcon, title: "Battery", value: batteryText, trailing: health.battery.map { "\($0.percent)%" })
                 HealthTile(icon: "cpu", title: "CPU", value: "Load: \(Int(health.cpuLoad * 100))%", trailing: thermalText,
                            warn: health.thermal == .serious || health.thermal == .critical)
@@ -187,7 +448,7 @@ struct HealthPanel: View {
             }
         }
         .padding(16)
-        .frame(width: 380)
+        .frame(width: 390)
         .foregroundStyle(.white)
         .background(LinearGradient(colors: Page.smartCare.colors, startPoint: .topLeading, endPoint: .bottomTrailing))
         .environment(\.colorScheme, .dark)

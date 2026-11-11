@@ -206,46 +206,101 @@ enum Maintenance {
 }
 
 struct MaintenanceView: View {
+    @ObservedObject var store: Store
     @State private var results: [String: (ok: Bool, message: String)] = [:]
     @State private var running: String?
+
+    var health: HealthMonitor { store.health }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 16) {
                 IconTile(symbol: "wrench.and.screwdriver", colors: [.white.opacity(0.4), .white.opacity(0.1)], size: 58)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Maintenance").font(.system(size: 30, weight: .bold, design: .rounded))
-                    Text("Quick fixes for a slow or misbehaving Mac. Tasks marked with a lock ask for your password.").opacity(0.75)
+                    Text("Maintenance & Health").font(.system(size: 30, weight: .bold, design: .rounded))
+                    Text("Live system pressure gauges and quick performance fixes. Free inactive memory with 1 click.").opacity(0.75)
                 }
             }
             .padding(.horizontal, 32).padding(.top, 44).padding(.bottom, 20)
 
             ScrollView {
-                LazyVStack(spacing: 10) {
-                    ForEach(Maintenance.tasks) { task in
-                        Card {
-                            HStack(spacing: 14) {
-                                IconTile(symbol: task.icon, colors: Page.maintenance.colors, size: 40)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    HStack(spacing: 6) {
-                                        Text(task.title).font(.system(size: 14, weight: .semibold))
-                                        if task.needsAdmin { Image(systemName: "lock.fill").font(.caption).opacity(0.6) }
+                VStack(spacing: 16) {
+                    // Live Real-Time RAM & CPU Pressure Gauges & 1-Click Purge Card
+                    Card {
+                        HStack(alignment: .center, spacing: 24) {
+                            AnimatedPressureGauge(
+                                title: "RAM",
+                                subtitle: "\(health.memoryPressure)% pressure",
+                                value: Double(health.memoryPressure) / 100.0,
+                                displayPercent: health.memoryPressure,
+                                icon: "memorychip",
+                                size: 90
+                            )
+
+                            AnimatedPressureGauge(
+                                title: "CPU",
+                                subtitle: "\(Int(health.cpuLoad * 100))% load",
+                                value: health.cpuLoad,
+                                displayPercent: Int(health.cpuLoad * 100),
+                                icon: "cpu",
+                                size: 90
+                            )
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Real-Time Memory Pressure")
+                                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                                Text("Total Physical RAM: \(bytes(Int64(health.totalMemory)))")
+                                    .font(.caption.weight(.semibold)).opacity(0.85)
+
+                                HStack(spacing: 16) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Active: \(bytes(Int64(health.activeMemory)))")
+                                            .font(.caption2).opacity(0.75)
+                                        Text("Inactive: \(bytes(Int64(health.inactiveMemory)))")
+                                            .font(.caption2.weight(.bold)).foregroundStyle(.yellow)
                                     }
-                                    Text(task.detail).font(.caption).opacity(0.7).fixedSize(horizontal: false, vertical: true)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Wired: \(bytes(Int64(health.detailedMemory.wired)))")
+                                            .font(.caption2).opacity(0.75)
+                                        Text("Compressed: \(bytes(Int64(health.detailedMemory.compressed)))")
+                                            .font(.caption2).opacity(0.75)
+                                    }
                                 }
-                                Spacer()
-                                if let r = results[task.id] {
-                                    Label(r.message, systemImage: r.ok ? "checkmark.circle.fill" : "xmark.circle")
-                                        .font(.caption).lineLimit(1).frame(maxWidth: 140, alignment: .trailing)
-                                }
-                                if running == task.id {
-                                    ProgressView().controlSize(.small)
-                                } else {
-                                    PillButton(title: "Run", icon: "play.fill") { run(task) }
-                                        .disabled(running != nil)
-                                }
+
+                                PurgeMemoryButton(health: health)
+                                    .padding(.top, 4)
                             }
-                            .padding(14)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(16)
+                    }
+
+                    LazyVStack(spacing: 10) {
+                        ForEach(Maintenance.tasks) { task in
+                            Card {
+                                HStack(spacing: 14) {
+                                    IconTile(symbol: task.icon, colors: Page.maintenance.colors, size: 40)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        HStack(spacing: 6) {
+                                            Text(task.title).font(.system(size: 14, weight: .semibold))
+                                            if task.needsAdmin { Image(systemName: "lock.fill").font(.caption).opacity(0.6) }
+                                        }
+                                        Text(task.detail).font(.caption).opacity(0.7).fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    Spacer()
+                                    if let r = results[task.id] {
+                                        Label(r.message, systemImage: r.ok ? "checkmark.circle.fill" : "xmark.circle")
+                                            .font(.caption).lineLimit(1).frame(maxWidth: 140, alignment: .trailing)
+                                    }
+                                    if running == task.id {
+                                        ProgressView().controlSize(.small)
+                                    } else {
+                                        PillButton(title: "Run", icon: "play.fill") { run(task) }
+                                            .disabled(running != nil)
+                                    }
+                                }
+                                .padding(14)
+                            }
                         }
                     }
                 }
@@ -257,6 +312,14 @@ struct MaintenanceView: View {
 
     private func run(_ task: MaintenanceTask) {
         running = task.id
+        if task.id == "purge" {
+            Task {
+                await health.purgeInactiveMemory()
+                results[task.id] = (true, health.purgeStatusMessage ?? "Done")
+                running = nil
+            }
+            return
+        }
         // NSAppleScript must run on the main thread; let the spinner draw first.
         DispatchQueue.main.async {
             results[task.id] = Maintenance.run(task)

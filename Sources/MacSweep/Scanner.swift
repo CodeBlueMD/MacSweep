@@ -1,15 +1,24 @@
 import AppKit
+import Darwin
 import Foundation
 import Security
+
+enum SafetyTier: String, Sendable, CaseIterable {
+    case junk = "Tier 1: Junk"
+    case costlyToRebuild = "Tier 2: Costly to Rebuild"
+    case protected = "Tier 3: Protected"
+}
 
 struct CleanItem: Identifiable, Hashable, Sendable {
     let id = UUID()
     let url: URL
-    let title: String
-    let detail: String
+    var title: String
+    var detail: String
     let size: Int64
     /// Simulator devices are removed through `simctl` so CoreSimulator stays consistent.
     var simulatorUDID: String? = nil
+    var tier: SafetyTier = .junk
+    var inUseBy: String? = nil
 }
 
 struct ItemGroup: Identifiable, Sendable {
@@ -18,6 +27,7 @@ struct ItemGroup: Identifiable, Sendable {
     let icon: String
     var iconPath: String? = nil
     var preselect = false
+    var tier: SafetyTier = .junk
     var items: [CleanItem]
     var size: Int64 { items.reduce(0) { $0 + $1.size } }
 }
@@ -59,8 +69,14 @@ enum Scanner {
         return total
     }
 
-    static func item(_ url: URL, title: String? = nil) -> CleanItem {
-        CleanItem(url: url, title: title ?? url.lastPathComponent, detail: tilde(url.deletingLastPathComponent()), size: size(of: url))
+    static func item(_ url: URL, title: String? = nil, tier: SafetyTier = .junk, inUseBy: String? = nil) -> CleanItem {
+        let detailText: String
+        if let inUseBy {
+            detailText = "In Use by \(inUseBy) · \(tilde(url.deletingLastPathComponent()))"
+        } else {
+            detailText = tilde(url.deletingLastPathComponent())
+        }
+        return CleanItem(url: url, title: title ?? url.lastPathComponent, detail: detailText, size: size(of: url), tier: tier, inUseBy: inUseBy)
     }
 
     /// Other apps' sandbox containers are only readable with Full Disk Access; without it
@@ -69,33 +85,55 @@ enum Scanner {
         FileHandle(forReadingAtPath: lib("Application Support/com.apple.TCC/TCC.db").path) != nil
     }
 
-    static func group(_ id: String, _ title: String, _ icon: String, preselect: Bool = true, _ items: [CleanItem]) -> ItemGroup? {
+    static func group(_ id: String, _ title: String, _ icon: String, preselect: Bool = true, tier: SafetyTier = .junk, _ items: [CleanItem]) -> ItemGroup? {
         let kept = items.filter { $0.size > 0 }.sorted { $0.size > $1.size }
-        return kept.isEmpty ? nil : ItemGroup(id: id, title: title, icon: icon, preselect: preselect, items: kept)
+        guard !kept.isEmpty else { return nil }
+        var tagged = kept
+        for i in 0..<tagged.count {
+            if tagged[i].tier != tier && tagged[i].tier == .junk {
+                tagged[i].tier = tier
+            }
+        }
+        return ItemGroup(id: id, title: title, icon: icon, preselect: preselect, tier: tier, items: tagged)
     }
 
     /// One item per entry inside `dir`.
-    static func contents(_ id: String, _ title: String, _ icon: String, _ dir: URL, preselect: Bool = true) -> ItemGroup? {
-        group(id, title, icon, preselect: preselect, children(dir).map { item($0) })
+    static func contents(_ id: String, _ title: String, _ icon: String, _ dir: URL, preselect: Bool = true, tier: SafetyTier = .junk) -> ItemGroup? {
+        group(id, title, icon, preselect: preselect, tier: tier, children(dir).map { item($0, tier: tier) })
     }
 
-    // MARK: System junk
+    // MARK: - 3-Tier Safety System (Mole's Rule)
 
     static func scanJunk() -> [ItemGroup] {
         let fda = hasFullDiskAccess
-        let caches = children(lib("Caches")).map { item($0) }
+        let caches = children(lib("Caches")).map { item($0, tier: .junk) }
+        let appCaches = caches.filter { !isAppleCache($0.url.lastPathComponent) }
+        let appleCaches = caches.filter { isAppleCache($0.url.lastPathComponent) }
+
         var groups: [ItemGroup?] = [
-            group("caches", "App Caches", "archivebox", caches.filter { !isAppleCache($0.url.lastPathComponent) }),
-            // macOS rebuilds these at once, so clearing them frees little and can trigger iCloud re-syncs.
-            group("appleCaches", "Apple System Caches", "apple.logo", preselect: false,
-                  caches.filter { isAppleCache($0.url.lastPathComponent) }),
-            fda ? group("containerCaches", "Sandboxed App Caches", "shippingbox", containerCaches()) : nil,
-            group("electron", "Electron & Web App Caches", "globe", electronCaches()),
-            contents("logs", "User Logs", "doc.text", lib("Logs")),
-            contents("gradle", "Gradle Caches", "cube", home.appendingPathComponent(".gradle/caches")),
-            group("brokenPrefs", "Broken Preference Files", "exclamationmark.triangle", brokenPreferences()),
+            // Tier 1 (Junk): Safe app caches where owner is closed -> Pre-selected
+            group("caches", "App Caches", "archivebox", preselect: true, tier: .junk, appCaches),
+            // Tier 2 (Costly to Rebuild): Apple system caches -> Never preselected
+            group("appleCaches", "Apple System Caches", "apple.logo", preselect: false, tier: .costlyToRebuild, appleCaches),
+            // Tier 1 (Junk): Container caches (if FDA granted)
+            fda ? group("containerCaches", "Sandboxed App Caches", "shippingbox", preselect: true, tier: .junk, containerCaches()) : nil,
+            // Tier 1 (Junk): Electron & web app caches
+            group("electron", "Electron & Web App Caches", "globe", preselect: true, tier: .junk, electronCaches()),
+            // Tier 1 (Junk): User Logs
+            contents("logs", "User Logs", "doc.text", lib("Logs"), preselect: true, tier: .junk),
+            // Tier 1 (Junk): Gradle Caches
+            contents("gradle", "Gradle Caches", "cube", home.appendingPathComponent(".gradle/caches"), preselect: true, tier: .junk),
+            // Tier 1 (Junk): Broken Preferences
+            group("brokenPrefs", "Broken Preference Files", "exclamationmark.triangle", preselect: true, tier: .junk, brokenPreferences()),
+            // Tier 1 (Junk): Broken Launch Agents
+            group("brokenAgents", "Broken Launch Agents", "exclamationmark.triangle", preselect: true, tier: .junk, brokenLaunchAgents()),
+            // Tier 2 (Costly to Rebuild): AI Models (~/.ollama, Hugging Face) -> Visible, NEVER pre-selected
+            group("aiModels", "AI Models & Cache (Ollama, Hugging Face)", "brain", preselect: false, tier: .costlyToRebuild, aiModels()),
         ]
+
         groups += xcodeJunk()
+
+        // Tier 3 (Protected): Files in use by open apps held back with clear 'In Use by <AppName>' tags
         return holdBackRunningApps(groups.compactMap { $0 })
     }
 
@@ -108,55 +146,221 @@ enum Scanner {
         name.hasPrefix("com.apple.") || name.hasPrefix("PFScene") || appleCacheNames.contains(name)
     }
 
-    struct RunningApp { let name: String; let bundleID: String }
+    // MARK: - Process and In-Use Inspection (Tier 3)
 
-    static func runningApps() -> [RunningApp] {
+    struct RunningAppInfo {
+        let name: String
+        let bundleID: String
+        let bundleURL: URL?
+        let pid: pid_t
+    }
+
+    static func runningAppInfos() -> [RunningAppInfo] {
         NSWorkspace.shared.runningApplications
             .filter { $0.activationPolicy != .prohibited }
             .compactMap { app in
-                guard let id = app.bundleIdentifier, !id.hasPrefix("com.apple.") else { return nil }
-                return RunningApp(name: app.localizedName ?? "", bundleID: id)
+                guard let id = app.bundleIdentifier else { return nil }
+                let name = app.localizedName ?? (id.split(separator: ".").last.map(String.init) ?? id)
+                return RunningAppInfo(name: name, bundleID: id, bundleURL: app.bundleURL, pid: app.processIdentifier)
             }
     }
 
-    /// The running app an item belongs to, judged by the folder directly inside its Library category
-    /// (`Caches/com.anthropic.claudefordesktop`, `Application Support/Claude/Cache` and `Developer/Xcode/…` all count).
-    static func owner(of url: URL, among apps: [RunningApp]) -> RunningApp? {
+    /// Open file paths for running applications, mapped to the app name.
+    static func openFilesByRunningApps(apps: [RunningAppInfo]) -> [String: String] {
+        var map: [String: String] = [:]
+        for app in apps {
+            let pid = app.pid
+            let bufferSize = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+            guard bufferSize > 0 else { continue }
+            let count = Int(bufferSize) / MemoryLayout<proc_fdinfo>.stride
+            var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: count)
+            guard proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, bufferSize) > 0 else { continue }
+            for fd in fds where fd.proc_fdtype == PROX_FDTYPE_VNODE {
+                var vnodeInfo = vnode_fdinfowithpath()
+                let vnodeSize = Int32(MemoryLayout<vnode_fdinfowithpath>.stride)
+                if proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &vnodeInfo, vnodeSize) > 0 {
+                    withUnsafePointer(to: &vnodeInfo.pvip.vip_path) { ptr in
+                        let path = String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+                        if !path.isEmpty {
+                            map[path] = app.name
+                        }
+                    }
+                }
+            }
+        }
+        return map
+    }
+
+    /// Checks if a file or directory is actively in use by a running application.
+    static func inUseByApp(for url: URL, apps: [RunningAppInfo], openFiles: [String: String]) -> String? {
+        let itemPath = url.standardizedFileURL.path
+
+        // 1. Direct open file handle
+        if let direct = openFiles[itemPath] { return direct }
+        for (filePath, appName) in openFiles {
+            if filePath.hasPrefix(itemPath + "/") { return appName }
+        }
+
+        // 2. Binary execution path (e.g. app running directly from DerivedData)
+        for app in apps {
+            guard let bundlePath = app.bundleURL?.standardizedFileURL.path else { continue }
+            if bundlePath.hasPrefix(itemPath) || itemPath.hasPrefix(bundlePath) {
+                return app.name
+            }
+        }
+
+        // 3. Category ownership for open apps
         let libraryPath = lib("").path + "/"
-        guard url.path.hasPrefix(libraryPath) else { return nil }
-        let parts = url.path.dropFirst(libraryPath.count).split(separator: "/")
-        guard parts.count >= 2 else { return nil }
-        let folder = parts[1].lowercased()
-        return apps.first { app in
-            let id = app.bundleID.lowercased()
-            let name = app.name.lowercased()
-            // "Google Chrome" keeps its cache in Caches/Google, so the first word of the name counts too.
-            let firstWord = name.split(separator: " ").first.map(String.init) ?? name
-            return folder == id || folder.hasPrefix(id + ".")
-                || (!name.isEmpty && (folder == name || (firstWord.count > 2 && folder == firstWord)))
+        if itemPath.hasPrefix(libraryPath) {
+            let subpath = itemPath.dropFirst(libraryPath.count)
+            let parts = subpath.split(separator: "/")
+            if parts.count >= 2 {
+                let category = parts[0].lowercased()
+                let folder = parts[1].lowercased()
+
+                for app in apps {
+                    let id = app.bundleID.lowercased()
+                    let name = app.name.lowercased()
+                    let firstWord = name.split(separator: " ").first.map(String.init) ?? name
+
+                    if category == "caches" || category == "containers" || category == "application support" {
+                        if folder == id || folder.hasPrefix(id + ".") || (!name.isEmpty && (folder == name || (firstWord.count > 2 && folder == firstWord))) {
+                            return app.name
+                        }
+                    } else if category == "developer" {
+                        if app.bundleID == "com.apple.dt.Xcode" {
+                            return "Xcode"
+                        }
+                    }
+                }
+            }
         }
+
+        return nil
     }
 
-    /// Moves items owned by open apps into their own unselected group: clearing a running app's cache
-    /// can make it misbehave until it is restarted.
+    /// Tier 3 Safety Rule: Moves all items actively in use by open apps into a protected, unselected group
+    /// and tags each item clearly with 'In Use by <AppName>'.
     static func holdBackRunningApps(_ groups: [ItemGroup]) -> [ItemGroup] {
-        let apps = runningApps()
-        var inUse: [CleanItem] = []
-        var kept: [ItemGroup] = []
-        for var g in groups {
-            guard g.preselect else { kept.append(g); continue }
-            g.items = g.items.filter { item in
-                guard let app = owner(of: item.url, among: apps) else { return true }
-                inUse.append(CleanItem(url: item.url, title: item.title, detail: "\(app.name) is open: quit it first · \(item.detail)",
-                                       size: item.size, simulatorUDID: item.simulatorUDID))
-                return false
+        let apps = runningAppInfos()
+        let openFiles = openFilesByRunningApps(apps: apps)
+
+        var inUseItems: [CleanItem] = []
+        var updatedGroups: [ItemGroup] = []
+
+        for var group in groups {
+            var keptItems: [CleanItem] = []
+            for item in group.items {
+                if let appName = inUseByApp(for: item.url, apps: apps, openFiles: openFiles) {
+                    var protectedItem = item
+                    protectedItem.tier = .protected
+                    protectedItem.inUseBy = appName
+                    protectedItem.detail = "In Use by \(appName) · Quit app to clean · \(item.detail)"
+                    inUseItems.append(protectedItem)
+                } else {
+                    keptItems.append(item)
+                }
             }
-            if !g.items.isEmpty { kept.append(g) }
+            if !keptItems.isEmpty {
+                group.items = keptItems
+                updatedGroups.append(group)
+            }
         }
-        if let held = group("inUse", "In Use by Open Apps", "lock.app.dashed", preselect: false, inUse) {
-            kept.insert(held, at: 0)
+
+        if !inUseItems.isEmpty {
+            let sortedInUse = inUseItems.sorted { $0.size > $1.size }
+            if let heldGroup = ItemGroup(id: "inUse",
+                                         title: "In Use by Open Apps",
+                                         icon: "lock.shield.fill",
+                                         preselect: false,
+                                         tier: .protected,
+                                         items: sortedInUse) as ItemGroup? {
+                updatedGroups.insert(heldGroup, at: 0)
+            }
         }
-        return kept
+
+        return updatedGroups
+    }
+
+    // MARK: - AI Models Scanner (Tier 2: Costly to Rebuild)
+
+    static func aiModels() -> [CleanItem] {
+        var results: [CleanItem] = []
+
+        // 1. Ollama models: ~/.ollama/models
+        let ollamaDir = home.appendingPathComponent(".ollama")
+        let ollamaModels = ollamaDir.appendingPathComponent("models")
+        if exists(ollamaModels) {
+            let manifestsDir = ollamaModels.appendingPathComponent("manifests")
+            var manifestFound = false
+            if exists(manifestsDir) {
+                let keys: [URLResourceKey] = [.isRegularFileKey]
+                if let enumerator = fm.enumerator(at: manifestsDir, includingPropertiesForKeys: keys, errorHandler: { _, _ in true }) {
+                    for case let manifestURL as URL in enumerator {
+                        guard let v = try? manifestURL.resourceValues(forKeys: [.isRegularFileKey]), v.isRegularFile == true else { continue }
+                        let tag = manifestURL.lastPathComponent
+                        let model = manifestURL.deletingLastPathComponent().lastPathComponent
+                        guard let data = try? Data(contentsOf: manifestURL),
+                              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                              let layers = json["layers"] as? [[String: Any]] else { continue }
+
+                        var modelSize: Int64 = 0
+                        for layer in layers {
+                            if let s = layer["size"] as? Int64 { modelSize += s }
+                            else if let s = layer["size"] as? Int { modelSize += Int64(s) }
+                        }
+                        manifestFound = true
+                        let modelName = (tag == "latest" || tag.isEmpty) ? model : "\(model):\(tag)"
+                        results.append(CleanItem(
+                            url: manifestURL,
+                            title: "Ollama: \(modelName)",
+                            detail: "AI Model in ~/.ollama · Costly to re-download",
+                            size: modelSize > 0 ? modelSize : size(of: manifestURL),
+                            tier: .costlyToRebuild
+                        ))
+                    }
+                }
+            }
+            if !manifestFound {
+                let blobsDir = ollamaModels.appendingPathComponent("blobs")
+                if exists(blobsDir) {
+                    for blob in children(blobsDir) where fileSize(blob) > 50_000_000 {
+                        results.append(CleanItem(
+                            url: blob,
+                            title: "Ollama Model Blob: \(blob.lastPathComponent.prefix(19))…",
+                            detail: "AI Weights in ~/.ollama/models/blobs · Costly to re-download",
+                            size: fileSize(blob),
+                            tier: .costlyToRebuild
+                        ))
+                    }
+                }
+            }
+        }
+
+        // 2. Hugging Face caches: ~/.cache/huggingface/hub and ~/Library/Caches/huggingface/hub
+        let hfLocations = [
+            home.appendingPathComponent(".cache/huggingface/hub"),
+            lib("Caches/huggingface/hub")
+        ]
+        for hubDir in hfLocations where exists(hubDir) {
+            for modelDir in children(hubDir) where modelDir.lastPathComponent.hasPrefix("models--") {
+                let displayName = modelDir.lastPathComponent
+                    .replacingOccurrences(of: "models--", with: "")
+                    .replacingOccurrences(of: "--", with: "/")
+                let s = size(of: modelDir)
+                if s > 0 {
+                    results.append(CleanItem(
+                        url: modelDir,
+                        title: "Hugging Face: \(displayName)",
+                        detail: "\(tilde(modelDir.deletingLastPathComponent())) · Costly to re-download",
+                        size: s,
+                        tier: .costlyToRebuild
+                    ))
+                }
+            }
+        }
+
+        return results.sorted { $0.size > $1.size }
     }
 
     /// `~/Library/Containers/<app>/Data/Library/Caches`, one item per app.
@@ -164,7 +368,7 @@ enum Scanner {
         children(lib("Containers")).compactMap { container in
             let caches = container.appendingPathComponent("Data/Library/Caches")
             guard exists(caches) else { return nil }
-            return CleanItem(url: caches, title: container.lastPathComponent, detail: tilde(caches), size: size(of: caches))
+            return CleanItem(url: caches, title: container.lastPathComponent, detail: tilde(caches), size: size(of: caches), tier: .junk)
         }
     }
 
@@ -175,7 +379,7 @@ enum Scanner {
         return children(lib("Application Support")).flatMap { app in
             names.map { app.appendingPathComponent($0) }
                 .filter(exists)
-                .map { item($0, title: "\(app.lastPathComponent) · \($0.lastPathComponent)") }
+                .map { item($0, title: "\(app.lastPathComponent) · \($0.lastPathComponent)", tier: .junk) }
         }
     }
 
@@ -187,23 +391,138 @@ enum Scanner {
                 guard let data = try? Data(contentsOf: url) else { return false }
                 return data.isEmpty || (try? PropertyListSerialization.propertyList(from: data, format: nil)) == nil
             }
-            .map { item($0) }
+            .map { item($0, tier: .junk) }
+    }
+
+    /// Launch agents whose program executable is missing.
+    static func brokenLaunchAgents() -> [CleanItem] {
+        var broken: [CleanItem] = []
+        for url in children(lib("LaunchAgents")) where url.pathExtension == "plist" {
+            let dict = NSDictionary(contentsOf: url) as? [String: Any]
+            let program = dict?["Program"] as? String ?? (dict?["ProgramArguments"] as? [String])?.first
+            let label = dict?["Label"] as? String ?? url.lastPathComponent
+            let isBroken = dict == nil || program == nil || (program!.hasPrefix("/") && !exists(URL(fileURLWithPath: program!)))
+            if isBroken {
+                let detail = dict == nil ? "Unreadable plist" : program == nil ? "No program set, so it can never run" : "Missing: \(program!)"
+                broken.append(CleanItem(url: url, title: label, detail: detail, size: fileSize(url), tier: .junk))
+            }
+        }
+        return broken.sorted { $0.title < $1.title }
+    }
+
+    // MARK: - Developer & Xcode Inspection (Mole's Rule)
+
+    static func scanDerivedData() -> (active: [CleanItem], orphaned: [CleanItem]) {
+        let derivedRoot = dev("Xcode/DerivedData")
+        guard exists(derivedRoot) else { return ([], []) }
+
+        var active: [CleanItem] = []
+        var orphaned: [CleanItem] = []
+
+        for folder in children(derivedRoot) {
+            let s = size(of: folder)
+            guard s > 0 else { continue }
+
+            let infoPlist = folder.appendingPathComponent("info.plist")
+            var workspacePath: String? = nil
+            if exists(infoPlist),
+               let dict = NSDictionary(contentsOf: infoPlist) as? [String: Any],
+               let wp = dict["WorkspacePath"] as? String {
+                workspacePath = wp
+            }
+
+            if let wp = workspacePath {
+                let projectExists = fm.fileExists(atPath: wp)
+                let projName = URL(fileURLWithPath: wp).deletingPathExtension().lastPathComponent
+                if projectExists {
+                    active.append(CleanItem(
+                        url: folder,
+                        title: "\(projName) DerivedData",
+                        detail: "Active project: \(tilde(URL(fileURLWithPath: wp))) · Costly to recompile",
+                        size: s,
+                        tier: .costlyToRebuild
+                    ))
+                } else {
+                    orphaned.append(CleanItem(
+                        url: folder,
+                        title: "\(projName.isEmpty ? folder.lastPathComponent : projName) (Orphaned)",
+                        detail: "Project no longer exists (\(wp)) · Safe to clean",
+                        size: s,
+                        tier: .junk
+                    ))
+                }
+            } else {
+                let isCache = folder.lastPathComponent.hasSuffix(".noindex") || folder.lastPathComponent.hasPrefix("SDK")
+                if isCache {
+                    orphaned.append(CleanItem(
+                        url: folder,
+                        title: folder.lastPathComponent,
+                        detail: "\(tilde(derivedRoot)) · Xcode re-creates as needed",
+                        size: s,
+                        tier: .junk
+                    ))
+                } else {
+                    orphaned.append(CleanItem(
+                        url: folder,
+                        title: folder.lastPathComponent,
+                        detail: "Untracked build cache · \(tilde(derivedRoot))",
+                        size: s,
+                        tier: .junk
+                    ))
+                }
+            }
+        }
+        return (active.sorted { $0.size > $1.size }, orphaned.sorted { $0.size > $1.size })
+    }
+
+    static func scanSimulatorRuntimes() -> [CleanItem] {
+        var items: [CleanItem] = []
+        let runtimeDirs = [
+            dev("CoreSimulator/Caches"),
+            dev("CoreSimulator/Profiles/Runtimes"),
+            URL(fileURLWithPath: "/Library/Developer/CoreSimulator/Profiles/Runtimes")
+        ]
+        for dir in runtimeDirs where exists(dir) {
+            for child in children(dir) {
+                let s = size(of: child)
+                if s > 0 {
+                    items.append(CleanItem(
+                        url: child,
+                        title: child.lastPathComponent,
+                        detail: "\(tilde(dir)) · Simulator Runtime / Cache",
+                        size: s,
+                        tier: .costlyToRebuild
+                    ))
+                }
+            }
+        }
+        return items.sorted { $0.size > $1.size }
     }
 
     static func xcodeJunk() -> [ItemGroup?] {
         let xcode = dev("Xcode")
         let deviceSupport = ["iOS", "macOS", "watchOS", "tvOS", "visionOS"].flatMap { children(xcode.appendingPathComponent("\($0) DeviceSupport")) }
         let archives = children(xcode.appendingPathComponent("Archives")).flatMap(children).filter { $0.pathExtension == "xcarchive" }
+        let (activeDerived, orphanedDerived) = scanDerivedData()
+        let simulatorRuntimes = scanSimulatorRuntimes()
+
         return [
-            contents("derived", "Xcode DerivedData", "hammer", xcode.appendingPathComponent("DerivedData")),
-            contents("xcodeDocs", "Xcode Documentation Cache", "book", xcode.appendingPathComponent("DocumentationCache")),
-            contents("deviceLogs", "Xcode Device Logs", "doc.text.magnifyingglass", xcode.appendingPathComponent("iOS Device Logs")),
-            // Re-downloaded automatically the next time a device of that version is connected.
-            group("deviceSupport", "Xcode Device Support", "iphone.and.arrow.forward", preselect: false, deviceSupport.map { item($0) }),
-            // Archives hold the symbols needed to read crash reports for shipped builds.
-            group("archives", "Xcode Archives", "archivebox.fill", preselect: false, archives.map { item($0) }),
-            contents("simcaches", "Simulator Caches", "iphone", dev("CoreSimulator/Caches")),
-            group("simulators", "Unavailable Simulators", "iphone.slash", unavailableSimulators()),
+            // Tier 2: Active project DerivedData -> Visible, NEVER pre-selected
+            group("activeDerived", "Active Project DerivedData", "hammer.fill", preselect: false, tier: .costlyToRebuild, activeDerived),
+            // Tier 1: Orphaned DerivedData -> Pre-selected
+            group("orphanedDerived", "Orphaned DerivedData", "hammer", preselect: true, tier: .junk, orphanedDerived),
+            // Tier 1: Xcode Documentation Cache
+            contents("xcodeDocs", "Xcode Documentation Cache", "book", xcode.appendingPathComponent("DocumentationCache"), preselect: true, tier: .junk),
+            // Tier 1: Device Logs
+            contents("deviceLogs", "Xcode Device Logs", "doc.text.magnifyingglass", xcode.appendingPathComponent("iOS Device Logs"), preselect: true, tier: .junk),
+            // Tier 2: Simulator Runtimes & Caches -> Costly to rebuild, NEVER pre-selected
+            group("simRuntimes", "Simulator Runtimes & Caches", "iphone.badge.play", preselect: false, tier: .costlyToRebuild, simulatorRuntimes),
+            // Tier 2: Device Support -> Re-downloaded automatically, NEVER pre-selected
+            group("deviceSupport", "Xcode Device Support", "iphone.and.arrow.forward", preselect: false, tier: .costlyToRebuild, deviceSupport.map { item($0, tier: .costlyToRebuild) }),
+            // Tier 2: Archives -> Hold symbolication symbols, NEVER pre-selected
+            group("archives", "Xcode Archives", "archivebox.fill", preselect: false, tier: .costlyToRebuild, archives.map { item($0, tier: .costlyToRebuild) }),
+            // Tier 1: Unavailable Simulators -> Runtime missing, safe junk
+            group("simulators", "Unavailable Simulators", "iphone.slash", preselect: true, tier: .junk, unavailableSimulators()),
         ]
     }
 
@@ -219,7 +538,7 @@ enum Scanner {
                 let dir = dev("CoreSimulator/Devices/\(udid)")
                 let os = runtime.components(separatedBy: "SimRuntime.").last ?? runtime
                 return CleanItem(url: dir, title: device["name"] as? String ?? udid, detail: "\(os) · runtime no longer installed",
-                                 size: size(of: dir), simulatorUDID: udid)
+                                 size: size(of: dir), simulatorUDID: udid, tier: .junk)
             }
         }
     }

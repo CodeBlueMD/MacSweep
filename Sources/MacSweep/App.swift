@@ -44,7 +44,6 @@ struct MacSweepApp: App {
     }
 
     @StateObject private var store = Store()
-    @StateObject private var health = HealthMonitor()
 
     var body: some Scene {
         Window("MacSweep", id: "main") {
@@ -54,12 +53,12 @@ struct MacSweepApp: App {
 
         // The menu bar panel in a regular window; opened only by the UI tour so it can be captured.
         Window("Mac Health", id: "healthPreview") {
-            HealthPanel(health: health, store: store)
+            HealthPanel(health: store.health, store: store)
         }
         .windowResizability(.contentSize)
 
         MenuBarExtra {
-            HealthPanel(health: health, store: store)
+            HealthPanel(health: store.health, store: store)
         } label: {
             Image(nsImage: Brand.menuBarIcon)
         }
@@ -143,7 +142,7 @@ final class SectionModel: ObservableObject {
 
     init(_ section: Section) { self.section = section }
 
-    var selectedItems: [CleanItem] { groups.flatMap(\.items).filter { selected.contains($0.id) } }
+    var selectedItems: [CleanItem] { groups.flatMap(\.items).filter { selected.contains($0.id) && $0.tier != .protected } }
     var selectedSize: Int64 { selectedItems.reduce(0) { $0 + $1.size } }
     var totalSize: Int64 { groups.reduce(0) { $0 + $1.size } }
     var reportPart: Report.Part { Report.Part(section: section, groups: groups, selected: selected) }
@@ -179,6 +178,7 @@ final class Store: ObservableObject {
     @Published var page: Page = .smartCare
     /// Rail label to show as if hovered; set only by the UI tour.
     @Published var tourLabel: Page?
+    let health = HealthMonitor()
     let models = Dictionary(uniqueKeysWithValues: Section.allCases.map { ($0, SectionModel($0)) })
     let spaceMap = SpaceMapModel()
 
