@@ -1,8 +1,18 @@
+import AppKit
 import Darwin
 import Foundation
 import IOBluetooth
 import IOKit.ps
 import SwiftUI
+
+/// Information about a high-memory consuming application.
+struct HeavyApp: Identifiable {
+    let id: pid_t
+    let name: String
+    let residentBytes: UInt64
+    let icon: NSImage?
+    let app: NSRunningApplication
+}
 
 /// Live system readings for the menu bar panel, refreshed every two seconds while the app runs.
 @MainActor
@@ -34,6 +44,8 @@ final class HealthMonitor: ObservableObject {
     @Published var isPurgingMemory = false
     @Published var purgeStatusMessage: String? = nil
     @Published var purgeSuccess = false
+    @Published var lastPurgeRanAsRoot = false
+    @Published var heavyApps: [HeavyApp] = []
 
     var inactiveMemory: UInt64 { detailedMemory.inactive }
     var activeMemory: UInt64 { detailedMemory.active }
@@ -64,6 +76,43 @@ final class HealthMonitor: ObservableObject {
         return .excellent
     }
 
+    func refreshHeavyApps() {
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        var apps: [HeavyApp] = []
+        for running in NSWorkspace.shared.runningApplications {
+            guard running.processIdentifier != currentPID else { continue }
+            guard running.activationPolicy == .regular || running.activationPolicy == .accessory else { continue }
+            guard let name = running.localizedName, !name.isEmpty else { continue }
+
+            var info = proc_taskinfo()
+            let size = Int32(MemoryLayout<proc_taskinfo>.stride)
+            if proc_pidinfo(running.processIdentifier, PROC_PIDTASKINFO, 0, &info, size) == size {
+                if info.pti_resident_size > 0 {
+                    apps.append(HeavyApp(
+                        id: running.processIdentifier,
+                        name: name,
+                        residentBytes: info.pti_resident_size,
+                        icon: running.icon,
+                        app: running
+                    ))
+                }
+            }
+        }
+        apps.sort { $0.residentBytes > $1.residentBytes }
+        self.heavyApps = Array(apps.prefix(5))
+    }
+
+    func quitApp(_ app: HeavyApp) {
+        if !app.app.terminate() {
+            app.app.forceTerminate()
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            refreshHeavyApps()
+            refresh()
+        }
+    }
+
     func refresh() {
         let v = try? Scanner.home.resourceValues(forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey])
         diskTotal = Int64(v?.volumeTotalCapacity ?? 0)
@@ -72,6 +121,7 @@ final class HealthMonitor: ObservableObject {
         thermal = ProcessInfo.processInfo.thermalState
         battery = Self.battery()
         detailedMemory = Self.detailedMemory()
+        refreshHeavyApps()
 
         if let now = Self.cpuTicks() {
             if let last = lastCPU {
@@ -98,53 +148,71 @@ final class HealthMonitor: ObservableObject {
         ticks += 1
     }
 
-    /// 1-click inactive RAM purge with instant visual feedback and smooth animated transitions.
+    /// 1-click inactive RAM purge with privileged /usr/sbin/purge execution and honest settling measurement.
     func purgeInactiveMemory() async {
         guard !isPurgingMemory else { return }
         isPurgingMemory = true
         purgeSuccess = false
+        lastPurgeRanAsRoot = false
         purgeStatusMessage = "Purging inactive RAM…"
 
         let before = Self.detailedMemory()
+        let isSelfTest = ProcessInfo.processInfo.arguments.contains("--self-test")
 
-        await Task.detached(priority: .userInitiated) {
-            // Force inactive file-backed pages to be reclaimed by Darwin VM
-            let chunkSize = 64 * 1024 * 1024
-            let targetBytes = min(before.inactive, 2048 * 1024 * 1024)
-            let count = max(1, Int(targetBytes / UInt64(chunkSize)))
-            var chunks: [UnsafeMutableRawPointer] = []
-
-            for _ in 0..<count {
-                if let ptr = malloc(chunkSize) {
-                    memset(ptr, 0x55, chunkSize)
-                    chunks.append(ptr)
+        let executionResult: (ok: Bool, ranAsRoot: Bool, errorMsg: String?) = await Task.detached(priority: .userInitiated) {
+            if getuid() == 0 {
+                // Running as root (e.g. CLI runner with sudo)
+                let data = Scanner.run("/usr/sbin/purge", [])
+                let ok = data != nil
+                return (ok, true, ok ? nil : "purge command failed")
+            } else if isSelfTest {
+                // Headless self-test: refuse unprivileged fake purge; do not prompt user interactively
+                return (false, false, "Requires administrator privileges")
+            } else {
+                // Interactive GUI: run through standard macOS administrator privileges prompt
+                let escaped = "/usr/sbin/purge"
+                var error: NSDictionary?
+                let script = NSAppleScript(source: "do shell script \"\(escaped)\" with administrator privileges")
+                script?.executeAndReturnError(&error)
+                if let error {
+                    let cancelled = (error[NSAppleScript.errorNumber] as? Int) == -128
+                    return (false, false, cancelled ? "Cancelled" : (error[NSAppleScript.errorMessage] as? String ?? "Failed"))
                 }
+                return (true, true, nil)
             }
-            for ptr in chunks {
-                free(ptr)
-            }
-            chunks.removeAll()
-
-            // Also trigger system purge if permitted
-            _ = Scanner.run("/usr/sbin/purge", [])
         }.value
 
-        // Allow kernel paging to stabilize
-        try? await Task.sleep(nanoseconds: 350_000_000)
+        lastPurgeRanAsRoot = executionResult.ranAsRoot
+
+        guard executionResult.ok else {
+            isPurgingMemory = false
+            purgeSuccess = false
+            purgeStatusMessage = executionResult.errorMsg ?? "Failed to purge RAM"
+            Task {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if !self.isPurgingMemory { self.purgeStatusMessage = nil }
+            }
+            return
+        }
+
+        // Allow kernel VM pager to settle (2 seconds)
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
         refresh()
         let after = Self.detailedMemory()
 
-        let freed = max(0, Int64(before.inactive) - Int64(after.inactive))
+        let beforeAvailable = Int64(before.free + before.inactive)
+        let afterAvailable = Int64(after.free + after.inactive)
+        let freed = max(0, afterAvailable - beforeAvailable)
+
         purgeSuccess = true
-        // Report what was measured; when nothing moved, say so rather than claim a purge.
-        purgeStatusMessage = freed > 10_000_000 ? "Freed \(bytes(freed))" : "Already optimized"
+        purgeStatusMessage = freed > 25_000_000 ? "Freed \(bytes(freed))" : "Memory already optimized"
         isPurgingMemory = false
 
         Task {
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             if !self.isPurgingMemory {
                 self.purgeStatusMessage = nil
-                self.purgeSuccess = false // otherwise the green outline outlives its message
+                self.purgeSuccess = false
             }
         }
     }
@@ -377,6 +445,72 @@ struct PurgeMemoryButton: View {
     }
 }
 
+struct HeavyAppsList: View {
+    @ObservedObject var health: HealthMonitor
+    var maxVisible: Int = 5
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Heavy Consumers")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.8))
+                Spacer()
+                Text("RAM")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+
+            let visibleApps = Array(health.heavyApps.prefix(maxVisible))
+            if visibleApps.isEmpty {
+                Text("No heavy apps detected")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.6))
+                    .padding(.vertical, 2)
+            } else {
+                ForEach(visibleApps) { app in
+                    HStack(spacing: 8) {
+                        if let icon = app.icon {
+                            Image(nsImage: icon)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 16, height: 16)
+                        } else {
+                            Image(systemName: "app.fill")
+                                .font(.system(size: 13))
+                                .frame(width: 16, height: 16)
+                        }
+
+                        Text(app.name)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+
+                        Spacer()
+
+                        Text(bytes(Int64(app.residentBytes)))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.85))
+
+                        Button("Quit") {
+                            health.quitApp(app)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(.red.opacity(0.35)))
+                        .overlay(Capsule().strokeBorder(.red.opacity(0.5), lineWidth: 0.5))
+                    }
+                    .padding(.vertical, 1)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Menu bar panel
 
 struct HealthPanel: View {
@@ -399,38 +533,45 @@ struct HealthPanel: View {
                 Image(systemName: "laptopcomputer").font(.system(size: 38)).foregroundStyle(.cyan)
             }
 
-            // Real-Time Animated RAM & CPU Pressure Gauges Card
-            HStack(spacing: 14) {
-                AnimatedPressureGauge(
-                    title: "RAM",
-                    subtitle: "\(health.memoryPressure)% pressure",
-                    value: Double(health.memoryPressure) / 100.0,
-                    displayPercent: health.memoryPressure,
-                    icon: "memorychip",
-                    size: 74
-                )
+            // Real-Time Animated RAM & CPU Pressure Gauges Card with Heavy Apps
+            VStack(spacing: 10) {
+                HStack(spacing: 14) {
+                    AnimatedPressureGauge(
+                        title: "RAM",
+                        subtitle: "\(health.memoryPressure)% pressure",
+                        value: Double(health.memoryPressure) / 100.0,
+                        displayPercent: health.memoryPressure,
+                        icon: "memorychip",
+                        size: 74
+                    )
 
-                AnimatedPressureGauge(
-                    title: "CPU",
-                    subtitle: thermalText,
-                    value: health.cpuLoad,
-                    displayPercent: Int(health.cpuLoad * 100),
-                    icon: "cpu",
-                    size: 74
-                )
+                    AnimatedPressureGauge(
+                        title: "CPU",
+                        subtitle: thermalText,
+                        value: health.cpuLoad,
+                        displayPercent: Int(health.cpuLoad * 100),
+                        icon: "cpu",
+                        size: 74
+                    )
 
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("Memory Management")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("Inactive: \(bytes(Int64(health.inactiveMemory)))")
-                        .font(.caption).opacity(0.75)
-                    Text("Active: \(bytes(Int64(health.activeMemory)))")
-                        .font(.caption2).opacity(0.6)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Memory Management")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("Inactive: \(bytes(Int64(health.inactiveMemory)))")
+                            .font(.caption).opacity(0.75)
+                        Text("Active: \(bytes(Int64(health.activeMemory)))")
+                            .font(.caption2).opacity(0.6)
 
-                    PurgeMemoryButton(health: health)
-                        .padding(.top, 2)
+                        PurgeMemoryButton(health: health)
+                            .padding(.top, 2)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if !health.heavyApps.isEmpty {
+                    Divider().overlay(.white.opacity(0.15))
+                    HeavyAppsList(health: health, maxVisible: 3)
+                }
             }
             .padding(12)
             .background(RoundedRectangle(cornerRadius: 14).fill(.white.opacity(0.08)))
@@ -443,8 +584,7 @@ struct HealthPanel: View {
                            action: ("Free Up", { show(.smartCare) }))
                 HealthTile(icon: "memorychip", title: "Memory",
                            value: "Inactive: \(bytes(Int64(health.inactiveMemory)))",
-                           warn: health.memoryPressure >= 65,
-                           action: (health.isPurgingMemory ? "Purging…" : "Purge RAM", { Task { await health.purgeInactiveMemory() } }))
+                           warn: health.memoryPressure >= 65)
                 HealthTile(icon: batteryIcon, title: "Battery", value: batteryText, trailing: health.battery.map { "\($0.percent)%" })
                 HealthTile(icon: "cpu", title: "CPU", value: "Load: \(Int(health.cpuLoad * 100))%", trailing: thermalText,
                            warn: health.thermal == .serious || health.thermal == .critical)

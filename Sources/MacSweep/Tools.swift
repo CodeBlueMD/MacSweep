@@ -171,8 +171,6 @@ struct MaintenanceTask: Identifiable {
 
 enum Maintenance {
     static let tasks: [MaintenanceTask] = [
-        .init(id: "purge", title: "Free Up Memory", detail: "Clears inactive memory so open apps get more room. Takes a few seconds.",
-              icon: "memorychip", command: "/usr/sbin/purge", needsAdmin: true),
         .init(id: "dns", title: "Flush DNS Cache", detail: "Fixes websites that won't load or resolve to an old address.",
               icon: "network", command: "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder", needsAdmin: true),
         .init(id: "snapshots", title: "Thin Time Machine Snapshots",
@@ -264,14 +262,6 @@ struct MaintenanceView: View {
 
     private func run(_ task: MaintenanceTask) {
         running = task.id
-        if task.id == "purge" {
-            Task {
-                await health.purgeInactiveMemory()
-                results[task.id] = (true, health.purgeStatusMessage ?? "Done")
-                running = nil
-            }
-            return
-        }
         // NSAppleScript must run on the main thread; let the spinner draw first.
         DispatchQueue.main.async {
             results[task.id] = Maintenance.run(task)
@@ -280,57 +270,63 @@ struct MaintenanceView: View {
     }
 }
 
-/// Live RAM and CPU gauges with the 1-click purge. Observes the monitor directly: `Store` does not
-/// republish its readings, so inside `MaintenanceView` this card only refreshed when the page changed.
+/// Live RAM and CPU gauges with the 1-click purge and Heavy Apps monitor.
 struct LiveHealthCard: View {
     @ObservedObject var health: HealthMonitor
 
     var body: some View {
         Card {
-            HStack(alignment: .center, spacing: 24) {
-                AnimatedPressureGauge(
-                    title: "RAM",
-                    subtitle: "\(health.memoryPressure)% pressure",
-                    value: Double(health.memoryPressure) / 100.0,
-                    displayPercent: health.memoryPressure,
-                    icon: "memorychip",
-                    size: 90
-                )
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center, spacing: 24) {
+                    AnimatedPressureGauge(
+                        title: "RAM",
+                        subtitle: "\(health.memoryPressure)% pressure",
+                        value: Double(health.memoryPressure) / 100.0,
+                        displayPercent: health.memoryPressure,
+                        icon: "memorychip",
+                        size: 90
+                    )
 
-                AnimatedPressureGauge(
-                    title: "CPU",
-                    subtitle: "\(Int(health.cpuLoad * 100))% load",
-                    value: health.cpuLoad,
-                    displayPercent: Int(health.cpuLoad * 100),
-                    icon: "cpu",
-                    size: 90
-                )
+                    AnimatedPressureGauge(
+                        title: "CPU",
+                        subtitle: "\(Int(health.cpuLoad * 100))% load",
+                        value: health.cpuLoad,
+                        displayPercent: Int(health.cpuLoad * 100),
+                        icon: "cpu",
+                        size: 90
+                    )
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Real-Time Memory Pressure")
-                        .font(.system(size: 15, weight: .bold, design: .rounded))
-                    Text("Total Physical RAM: \(bytes(Int64(health.totalMemory)))")
-                        .font(.caption.weight(.semibold)).opacity(0.85)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Real-Time Memory Pressure")
+                            .font(.system(size: 15, weight: .bold, design: .rounded))
+                        Text("Total Physical RAM: \(bytes(Int64(health.totalMemory)))")
+                            .font(.caption.weight(.semibold)).opacity(0.85)
 
-                    HStack(spacing: 16) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Active: \(bytes(Int64(health.activeMemory)))")
-                                .font(.caption2).opacity(0.75)
-                            Text("Inactive: \(bytes(Int64(health.inactiveMemory)))")
-                                .font(.caption2.weight(.bold)).foregroundStyle(.yellow)
+                        HStack(spacing: 16) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Active: \(bytes(Int64(health.activeMemory)))")
+                                    .font(.caption2).opacity(0.75)
+                                Text("Inactive: \(bytes(Int64(health.inactiveMemory)))")
+                                    .font(.caption2.weight(.bold)).foregroundStyle(.yellow)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Wired: \(bytes(Int64(health.detailedMemory.wired)))")
+                                    .font(.caption2).opacity(0.75)
+                                Text("Compressed: \(bytes(Int64(health.detailedMemory.compressed)))")
+                                    .font(.caption2).opacity(0.75)
+                            }
                         }
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Wired: \(bytes(Int64(health.detailedMemory.wired)))")
-                                .font(.caption2).opacity(0.75)
-                            Text("Compressed: \(bytes(Int64(health.detailedMemory.compressed)))")
-                                .font(.caption2).opacity(0.75)
-                        }
+
+                        PurgeMemoryButton(health: health)
+                            .padding(.top, 4)
                     }
-
-                    PurgeMemoryButton(health: health)
-                        .padding(.top, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if !health.heavyApps.isEmpty {
+                    Divider().overlay(.white.opacity(0.12))
+                    HeavyAppsList(health: health, maxVisible: 5)
+                }
             }
             .padding(16)
         }

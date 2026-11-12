@@ -123,17 +123,31 @@ enum SelfTest {
         check("health: total memory", health.totalMemory > 0, "\(bytes(Int64(health.totalMemory)))")
         check("health: active memory measured", health.activeMemory > 0, "\(bytes(Int64(health.activeMemory)))")
 
-        // Test 1-click inactive RAM purge
+        // Test Heavy Apps detection
+        health.refreshHeavyApps()
+        check("health: heavy apps detected", !health.heavyApps.isEmpty, "\(health.heavyApps.count) apps detected, top: \(health.heavyApps.first?.name ?? "none") (\(bytes(Int64(health.heavyApps.first?.residentBytes ?? 0))))")
+
+        // Check that /usr/sbin/purge exists
+        check("health: /usr/sbin/purge exists", fm.isExecutableFile(atPath: "/usr/sbin/purge"), "/usr/sbin/purge")
+
+        // Test RAM purge privilege enforcement and honesty
         var purgeFinished = false
         Task {
             await health.purgeInactiveMemory()
             purgeFinished = true
         }
-        let purgeTimeout = Date().addingTimeInterval(5.0)
+        let purgeTimeout = Date().addingTimeInterval(6.0)
         while !purgeFinished && Date() < purgeTimeout {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
-        check("health: 1-click RAM purge completed", health.purgeSuccess, health.purgeStatusMessage ?? "Done")
+
+        if getuid() == 0 {
+            // Running as root -> purge actually runs with root privileges
+            check("health: RAM purge ran as root", health.lastPurgeRanAsRoot && health.purgeSuccess, health.purgeStatusMessage ?? "Done")
+        } else {
+            // Unprivileged self-test -> verifies purge fails closed without root rather than faking success
+            check("health: RAM purge requires root privileges", !health.lastPurgeRanAsRoot && health.purgeStatusMessage == "Requires administrator privileges", health.purgeStatusMessage ?? "")
+        }
 
         // 6. Every maintenance task's command exists on this macOS version (tasks are not run).
         for task in Maintenance.tasks {
