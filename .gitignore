@@ -7,3 +7,4 @@ MacSweep Report*.md
 report*.md
 # Internal analysis notes stay local.
 docs/
+*.dmg

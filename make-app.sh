@@ -1,5 +1,6 @@
 #!/bin/zsh
-# Builds MacSweep.app (release, ad-hoc signed) next to this script.
+# Builds MacSweep.app (release) next to this script. Ad-hoc signed by default;
+# set SIGN_ID to a local codesign identity to keep Full Disk Access across rebuilds.
 set -euo pipefail
 cd "${0:A:h}"
 swift build -c release
@@ -26,5 +27,5 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSBluetoothAlwaysUsageDescription</key><string>MacSweep lists your connected Bluetooth devices in the Mac Health menu.</string>
 </dict></plist>
 PLIST
-codesign --force -s - "$APP"
+codesign --force -s "${SIGN_ID:--}" "$APP"
 echo "Built $PWD/$APP"
