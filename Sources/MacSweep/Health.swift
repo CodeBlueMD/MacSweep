@@ -9,7 +9,7 @@ import SwiftUI
 struct HeavyApp: Identifiable {
     let id: pid_t
     let name: String
-    let residentBytes: UInt64
+    let footprintBytes: UInt64
     let icon: NSImage?
     let app: NSRunningApplication
 }
@@ -76,29 +76,53 @@ final class HealthMonitor: ObservableObject {
         return .excellent
     }
 
+    /// Memory footprint of every process, in bytes. This is the figure Activity Monitor shows as "Memory".
+    private static func processFootprints() -> [(path: String, bytes: UInt64)] {
+        let capacity = 4096
+        var pids = [pid_t](repeating: 0, count: capacity)
+        let count = Int(proc_listallpids(&pids, Int32(capacity * MemoryLayout<pid_t>.stride)))
+        guard count > 0 else { return [] }
+        var result: [(String, UInt64)] = []
+        var pathBuffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        for pid in pids.prefix(count) where pid > 0 {
+            guard proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count)) > 0 else { continue }
+            var usage = rusage_info_v4()
+            let status = withUnsafeMutablePointer(to: &usage) { pointer in
+                pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                    proc_pid_rusage(pid, RUSAGE_INFO_V4, $0)
+                }
+            }
+            guard status == 0, usage.ri_phys_footprint > 0 else { continue }
+            result.append((String(cString: pathBuffer), usage.ri_phys_footprint))
+        }
+        return result
+    }
+
+    /// Lists the apps using the most memory. Each app's total includes its helper processes
+    /// (browser tabs, Electron renderers), which live inside the app bundle.
     func refreshHeavyApps() {
         let currentPID = ProcessInfo.processInfo.processIdentifier
+        let processes = Self.processFootprints()
         var apps: [HeavyApp] = []
         for running in NSWorkspace.shared.runningApplications {
             guard running.processIdentifier != currentPID else { continue }
             guard running.activationPolicy == .regular || running.activationPolicy == .accessory else { continue }
             guard let name = running.localizedName, !name.isEmpty else { continue }
+            guard let bundlePath = running.bundleURL?.path else { continue }
 
-            var info = proc_taskinfo()
-            let size = Int32(MemoryLayout<proc_taskinfo>.stride)
-            if proc_pidinfo(running.processIdentifier, PROC_PIDTASKINFO, 0, &info, size) == size {
-                if info.pti_resident_size > 0 {
-                    apps.append(HeavyApp(
-                        id: running.processIdentifier,
-                        name: name,
-                        residentBytes: info.pti_resident_size,
-                        icon: running.icon,
-                        app: running
-                    ))
-                }
+            let prefix = bundlePath.hasSuffix("/") ? bundlePath : bundlePath + "/"
+            let total = processes.reduce(UInt64(0)) { $0 + ($1.path.hasPrefix(prefix) ? $1.bytes : 0) }
+            if total > 0 {
+                apps.append(HeavyApp(
+                    id: running.processIdentifier,
+                    name: name,
+                    footprintBytes: total,
+                    icon: running.icon,
+                    app: running
+                ))
             }
         }
-        apps.sort { $0.residentBytes > $1.residentBytes }
+        apps.sort { $0.footprintBytes > $1.footprintBytes }
         self.heavyApps = Array(apps.prefix(5))
     }
 
@@ -489,7 +513,7 @@ struct HeavyAppsList: View {
 
                         Spacer()
 
-                        Text(bytes(Int64(app.residentBytes)))
+                        Text(bytes(Int64(app.footprintBytes)))
                             .font(.system(size: 11, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.white.opacity(0.85))
 

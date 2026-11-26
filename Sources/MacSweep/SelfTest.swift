@@ -125,7 +125,7 @@ enum SelfTest {
 
         // Test Heavy Apps detection
         health.refreshHeavyApps()
-        check("health: heavy apps detected", !health.heavyApps.isEmpty, "\(health.heavyApps.count) apps detected, top: \(health.heavyApps.first?.name ?? "none") (\(bytes(Int64(health.heavyApps.first?.residentBytes ?? 0))))")
+        check("health: heavy apps detected", !health.heavyApps.isEmpty, "\(health.heavyApps.count) apps detected, top: \(health.heavyApps.first?.name ?? "none") (\(bytes(Int64(health.heavyApps.first?.footprintBytes ?? 0))))")
 
         // Check that /usr/sbin/purge exists
         check("health: /usr/sbin/purge exists", fm.isExecutableFile(atPath: "/usr/sbin/purge"), "/usr/sbin/purge")
