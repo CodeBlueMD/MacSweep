@@ -1,8 +1,36 @@
 import AppKit
 import SwiftUI
 
+extension Notification.Name {
+    /// Posted when the user clicks the Dock icon while no MacSweep window is showing.
+    static let macSweepReopen = Notification.Name("app.macsweep.reopen")
+}
+
+/// Without this, closing the window leaves MacSweep running (menu bar icon) but the Dock icon does nothing.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { NotificationCenter.default.post(name: .macSweepReopen, object: nil) }
+        return true
+    }
+}
+
+/// The menu bar icon. It stays alive while the main window is closed, so it can reopen the window.
+private struct MenuBarLabel: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Image(nsImage: Brand.menuBarIcon)
+            .onReceive(NotificationCenter.default.publisher(for: .macSweepReopen)) { _ in
+                openWindow(id: "main")
+                NSApp.activate(ignoringOtherApps: true)
+            }
+    }
+}
+
 @main
 struct MacSweepApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     init() {
         // `MacSweep --scan-report` prints what each scan finds, without opening a window or removing anything.
         if CommandLine.arguments.contains("--scan-report") {
@@ -60,7 +88,7 @@ struct MacSweepApp: App {
         MenuBarExtra {
             HealthPanel(health: store.health, store: store)
         } label: {
-            Image(nsImage: Brand.menuBarIcon)
+            MenuBarLabel()
         }
         .menuBarExtraStyle(.window)
     }
